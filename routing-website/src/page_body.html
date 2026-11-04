@@ -1,0 +1,100 @@
+<!-- Page markup: console rail and map, assembled into index.html by build_page.py. -->
+<div class="app" id="app">
+  <aside class="rail" aria-label="Controls and results">
+    <div class="mast">
+      <h1>Malapert Node Planner</h1>
+      <p class="sub">Place relays on the 16 km Malapert map, then simulate the links back to the summit base.</p>
+      <button id="simulate" type="button">Simulate</button>
+      <div class="status"><span id="chip" class="chip stale">Loading</span><span id="stat">Loading terrain</span></div>
+    </div>
+    <div class="bar"><i id="prog"></i></div>
+    <div class="scroll">
+      <section aria-label="Result">
+        <h2>Result</h2>
+        <div class="readouts" id="rd">
+          <div class="ro"><span>Relays connected to base</span><strong id="r-conn">–</strong></div>
+          <div class="ro"><span>Weakest chain hop</span><strong id="r-weak">–</strong></div>
+          <div class="ro"><span>Reliable area</span><strong id="r-area">–</strong></div>
+          <div class="ro"><span>Route out of contact</span><strong id="r-out">–</strong></div>
+        </div>
+      </section>
+      <section aria-label="Plan">
+        <h2>Plan</h2>
+        <div class="btns">
+          <button id="add" class="btn" type="button" aria-pressed="false">Add relay</button>
+          <button id="clear" class="btn" type="button">Remove all relays</button>
+        </div>
+        <div class="autop">
+          <div class="btns">
+            <button id="auto" class="btn" type="button" aria-pressed="false">Find fewest relays to a point</button>
+            <button id="draw" class="btn" type="button" aria-pressed="false">Draw route</button>
+            <button id="undo" class="btn" type="button" hidden>Undo point</button>
+          </div>
+          <div class="autof">
+            <label class="f">Mast, m
+              <input id="auto-h" type="number" min="0.5" max="30" step="0.5" value="1.5">
+            </label>
+            <label class="f">Extra margin, dB
+              <input id="auto-x" type="number" min="0" max="20" step="1" value="0">
+            </label>
+          </div>
+        </div>
+      </section>
+      <section aria-label="Radio">
+        <h2>Radio</h2>
+        <label class="f">Preset
+          <select id="preset"></select>
+        </label>
+        <label class="f" for="freq">Free frequency</label>
+        <input id="freq" type="range" min="0" max="1000" step="1" aria-label="Frequency, 50 MHz to 3.5 GHz">
+        <div class="rowf"><span>50 MHz</span><span id="freq-v">433 MHz</span><span>3.5 GHz</span></div>
+        <label class="f" id="target-wrap" hidden>Rate to hold on the slider
+          <select id="target">
+            <option value="1758">1.76 kb/s, the SF9 rate</option>
+            <option value="10000">10 kb/s</option>
+            <option value="100000">100 kb/s</option>
+            <option value="1000000">1 Mb/s</option>
+          </select>
+        </label>
+        <label class="f">Link budget
+          <select id="budget">
+            <option value="10">Study: 10 dB fade margin</option>
+            <option value="22.5">Cautious: 22.5 dB fade margin</option>
+          </select>
+        </label>
+        <div class="rowf"><span id="budget-note"></span></div>
+        <label class="f">Crew antenna height, m
+          <input id="crewh" type="number" min="0.5" max="5" step="0.1" value="1.5">
+        </label>
+      </section>
+      <section aria-label="Sites">
+        <h2>Sites</h2>
+        <div id="nodes" class="nodes"></div>
+      </section>
+      <section aria-label="Links">
+        <h2>Links</h2>
+        <div class="tbl" id="links"></div>
+      </section>
+      <section aria-label="Map layers">
+        <h2>Map layer</h2>
+        <div class="ov" role="radiogroup" aria-label="Map layer">
+          <label><input type="radio" name="ov" value="coverage" id="ov-cov" checked>Coverage</label>
+          <label><input type="radio" name="ov" value="slope" id="ov-slope">Slope</label>
+          <label><input type="radio" name="ov" value="winter" id="ov-winter">Winter sun</label>
+          <label><input type="radio" name="ov" value="none" id="ov-none">Terrain only</label>
+        </div>
+        <div class="ov">
+          <label><input type="checkbox" id="t-psr">PSRs</label>
+          <label><input type="checkbox" id="t-route" checked>Route</label>
+        </div>
+      </section>
+    </div>
+  </aside>
+  <div class="mapwrap" id="wrap">
+    <canvas id="map" role="img" aria-label="Hillshade map of Malapert with radio coverage, relays, links and route"></canvas>
+    <div class="legend" id="legend"></div>
+    <div class="read" id="read" hidden></div>
+    <div class="maptop"><button id="zin" type="button" aria-label="Zoom in">+</button><button id="zout" type="button" aria-label="Zoom out">−</button></div>
+    <div class="hint" id="hint" hidden></div>
+  </div>
+</div>
