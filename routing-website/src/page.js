@@ -1,4 +1,4 @@
-// Page logic: data loading, worker pool, Simulate, canvas map, node dragging, readouts.
+// Page logic: data loading, worker pool, Simulate, canvas map, node dragging and antenna aiming, link profiles, saving and sharing, readouts.
 "use strict";
 (function () {
   var META = window.MALAPERT_META, VALID = window.MALAPERT_VALID, T = META.terrain, N = T.n, PLANS = META.plans;
@@ -19,11 +19,18 @@
     { id: "n78", group: "5G (fiveg_relays likely budget)", label: "n78, 3550 MHz, 1 Mb/s tier", f: 3550, nr: true, ceil: 128 },
     { id: "free", group: "Any frequency", label: "Free slider, practical Shannon", free: true }
   ];
+  var ALIB = window.MALAPERT_ANT, ANTS = {}, ASPEC = {}, GREF = 0;
+  ALIB.antennas.forEach(function (a) {
+    var s = atob(a.b64), g = new Float32Array(s.length), mx = -Infinity, i;
+    for (i = 0; i < s.length; i++) { var v = s.charCodeAt(i); g[i] = (v > 127 ? v - 256 : v) / 4; if (g[i] > mx) mx = g[i]; }
+    ASPEC[a.id] = { id: a.id, g: g, naz: a.naz, nel: a.nel, azStep: ALIB.az_step, elStep: ALIB.el_step, elMin: ALIB.el_min, beams: a.beams, iso: a.id === "iso" };
+    var A = ANTS[a.id] = new LL.Antenna(ASPEC[a.id]); A.meta = a; A.max = mx; if (mx > GREF) GREF = mx;
+  });
   var FADE_STUDY = 10, MAX_RELAYS = 12, HR_DEFAULT = 1.5, WALK_KMH = 1.8;
   var S = {
-    base: { id: "B", x: T.bx, y: T.by, h: 1.5 }, nodes: [], crew: { h: HR_DEFAULT }, target: null, picking: false,
-    preset: "sf9", fMHz: 433, fade: FADE_STUDY, target: 1758, nAz: 2880, overlay: "coverage", solo: null, plan: null,
-    sim: null, stale: true, busy: false, placing: false, sel: null, seq: 1, gen: 0, auto: null, drawing: false, draw: []
+    base: { id: "B", x: T.bx, y: T.by, h: 1.5, ant: "iso", bore: 0 }, nodes: [], crew: { h: HR_DEFAULT }, relayAnt: "iso", rxMode: "best", crewLoss: 0, showPat: true, prev: { who: "Relays", id: "iso" }, target: null, picking: false,
+    preset: "sf9", fMHz: 433, fade: FADE_STUDY, rateTarget: 1758, nAz: 2880, overlay: "coverage", solo: null, plan: null,
+    sim: null, stale: true, busy: false, placing: false, sel: null, seq: 1, gen: 0, auto: null, drawing: false, draw: [], prof: null, profData: null, profHover: null, probing: false
   };
   var view = { cx: T.bx, cy: T.by, s: 0.03 };
   var ter, lay = {}, overview = null, tiles = {}, covCan = null, layerCan = {}, pool = null, CACHE = new Map();
@@ -89,7 +96,7 @@
       }
       grid = { w: N, h: N, x0: T.x0, ytop: T.ytop, cell: T.cell, mask: mask };
       var nw = Math.max(1, (navigator.hardwareConcurrency || 2) - 1);
-      pool = new Pool(nw, { type: "init", dem: dem, terrain: { nr: N, nc: N, x0: T.x0, ytop: T.ytop, cell: T.cell, bx: T.bx, by: T.by, rdisk: T.rdisk } });
+      pool = new Pool(nw, { type: "init", dem: dem, ants: ASPEC, terrain: { nr: N, nc: N, x0: T.x0, ytop: T.ytop, cell: T.cell, bx: T.bx, by: T.by, rdisk: T.rdisk } });
       return pool.start();
     });
   }
@@ -105,8 +112,8 @@
   function radio() {
     var p = PRESETS.filter(function (q) { return q.id === S.preset; })[0], fade = S.fade;
     if (p.free) {
-      var f = S.fMHz * 1e6, o = { p_dbm: 22, a_m: 0.75, nf_db: 7, margin_db: fade, gap_db: 2 }, ceil = LL.lossForRate(f, S.target, o);
-      return { f: f, fMHz: S.fMHz, ceil: ceil, fade: fade, label: fmtF(S.fMHz) + ", " + fmtRate(S.target) + " target", rate: function (L) { return LL.shannonRate(f, L, o).rate; } };
+      var f = S.fMHz * 1e6, o = { p_dbm: 22, a_m: 0.75, nf_db: 7, margin_db: fade, gap_db: 2 }, ceil = LL.lossForRate(f, S.rateTarget, o);
+      return { f: f, fMHz: S.fMHz, ceil: ceil, fade: fade, label: fmtF(S.fMHz) + ", " + fmtRate(S.rateTarget) + " target", rate: function (L) { return LL.shannonRate(f, L, o).rate; } };
     }
     if (p.nr) return { f: p.f * 1e6, fMHz: p.f, ceil: p.ceil, fade: fade, label: p.label, rate: function (L) { return LL.nrRate(L, 23, 5.7, 8.4, fade); } };
     return { f: p.f * 1e6, fMHz: p.f, ceil: p.tx - p.sens, fade: fade, label: p.group + " " + p.label, rate: function (L) { return p.tx - p.sens - L >= fade ? p.bps : 0; } };
@@ -117,14 +124,41 @@
   function db(v) { return v.toFixed(Math.abs(v) >= 100 ? 0 : 1).replace("-", "−"); }
   function sign(v) { return (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(1); }
   // ---- simulate
+  // ---- antennas: gain toward a map bearing (clockwise from up) at a take-off elevation; planning gain for relays is the weaker of front and back, what a straight chain gets when aimed along it
+  function antGain(A, s, brg, el) { return A.iso ? 0 : s.tilt ? A.gainTilted(brg - (s.bore || 0), el, { t: s.tilt, ta: s.tiltAz || 0, bore: s.bore || 0 }) : A.gain(brg - (s.bore || 0), el); }
+  function gainAt(s, brg, el) { return antGain(ANTS[s.ant], s, brg, el); }
+  // Switched and phased arrays transmit on a beam; when they listen on their omni setting, receiving takes the dipole.
+  function omniRx(id) { return S.rxMode === "omni" && ANTS[id].beams > 1; }
+  function omniId(id) { return ANTS[id].meta.omni_id || "dipole"; }
+  function gainRx(s, brg, el) { return antGain(ANTS[omniRx(s.ant) ? omniId(s.ant) : s.ant], s, brg, el); }
+  function covAnt(s) { return omniRx(s.ant) ? omniId(s.ant) : s.ant; }
+  // Planning rows by elevation, so a search never promises more than Simulate gives: hops get the weaker of front and back (the worst bearing for steerable arrays), route points get the worst bearing.
+  var PLAN = {};
+  function planRows(id) {
+    var pk = id + (omniRx(id) ? "|omni" : "");
+    if (PLAN[pk]) return PLAN[pk];
+    var A = ANTS[id], n = A.nel, hop = new Float64Array(n), cov = new Float64Array(n), front = new Float64Array(n);
+    if (!A.iso) for (var e = 0; e < n; e++) {
+      var el = A.elMin + e * A.elStep, mn = Infinity;
+      for (var az = 0; az < 360; az += 2) mn = Math.min(mn, A.gain(az, el));
+      cov[e] = mn; front[e] = A.beams > 1 ? mn : A.gain(0, el); hop[e] = A.beams > 1 ? mn : Math.min(A.gain(0, el), A.gain(180, el));
+      if (omniRx(id)) { var dg = ANTS[omniId(id)].gain(0, el); cov[e] = Math.min(mn, dg); front[e] = hop[e] = (mn + dg) / 2; }
+    }
+    return (PLAN[pk] = { hop: hop, cov: cov, front: front });
+  }
+  function planG(id) { var r = planRows(id).hop; return function (el) { return LL.elGain(r, el); }; }
+  function covG(id) { var r = planRows(id).cov; return function (el) { return LL.elGain(r, el); }; }
+  function aimable(id) { var f = ANTS[id].meta.family; return f === "unidirectional" || f === "bidirectional" || f === "skewed"; }
+  function relay(id, x, y, h) { return { id: id, x: x, y: y, h: h, ant: S.relayAnt, bore: 0 }; }
+  function brg(a, b) { return LL.bearing(a.x, a.y, b.x, b.y); }
   function sites() { return [S.base].concat(S.nodes); }
-  function key(s, r) { return [s.x, s.y, s.h, S.crew.h, r.f, r.ceil.toFixed(2), S.nAz].join("|"); }
+  function key(s, r) { return [s.x, s.y, s.h, S.crew.h, r.f, r.ceil.toFixed(2), S.nAz, covAnt(s), ANTS[covAnt(s)].meta.family === "omni" && !s.tilt ? 0 : s.bore, s.tilt || 0, s.tiltAz || 0].join("|"); }
   var reused = 0;
   function coverage(s, r, onDone) {
     var k = key(s, r);
     if (CACHE.has(k)) { var v = CACHE.get(k); CACHE.delete(k); CACHE.set(k, v); reused++; onDone(); return Promise.resolve(v); }
     var ds = T.cell, nAz = S.nAz, maxN = Math.ceil((T.rdisk + Math.hypot(s.x - T.bx, s.y - T.by)) / ds) + 2, blocks = Math.max(pool.n * 4, 16), jobs = [];
-    for (var b = 0; b < blocks; b++) jobs.push(pool.run({ type: "cov", id: b, x: s.x, y: s.y, ht: s.h, hr: S.crew.h, f: r.f, nAz: nAz, ds: ds, maxN: maxN, a0: Math.floor(nAz * b / blocks), a1: Math.floor(nAz * (b + 1) / blocks), lossCut: r.ceil + 6 }));
+    for (var b = 0; b < blocks; b++) jobs.push(pool.run({ type: "cov", id: b, x: s.x, y: s.y, ht: s.h, hr: S.crew.h, f: r.f, nAz: nAz, ds: ds, maxN: maxN, a0: Math.floor(nAz * b / blocks), a1: Math.floor(nAz * (b + 1) / blocks), lossCut: r.ceil + 6 + Math.max(0, ANTS[covAnt(s)].max), ant: covAnt(s), bore: s.bore || 0, tilt: s.tilt || 0, tiltAz: s.tiltAz || 0 }));
     return Promise.all(jobs).then(function (res) {
       var polar = new Float32Array(nAz * (maxN + 1)), counts = new Int32Array(nAz);
       res.forEach(function (q) { polar.set(q.out, q.a0 * (maxN + 1)); counts.set(q.counts, q.a0); });
@@ -140,7 +174,7 @@
     if (S.busy || !pool) return Promise.resolve();
     S.busy = true; $("simulate").disabled = true; setChip("Running", "stale");
     var gen = S.gen;
-    var t0 = performance.now(), r = radio(), list = sites().map(function (q) { return { id: q.id, x: q.x, y: q.y, h: q.h }; }), n = list.length, pairs = [], ch = S.crew.h, done = 0;
+    var t0 = performance.now(), r = radio(), list = sites().map(function (q) { return { id: q.id, x: q.x, y: q.y, h: q.h, ant: q.ant, bore: q.bore, tilt: q.tilt || 0, tiltAz: q.tiltAz || 0 }; }), n = list.length, pairs = [], ch = S.crew.h, done = 0;
     var total = n + 2;
     var tick = function () { done++; $("prog").style.width = Math.min(100, 100 * done / total) + "%"; };
     for (var i = 0; i < n; i++) for (var j = 0; j < n; j++) if (i !== j) pairs.push(list[i].x, list[i].y, list[j].x, list[j].y, list[i].h, list[j].h);
@@ -149,7 +183,7 @@
       tick();
       var M = [], hop = [], p = 0;
       for (i = 0; i < n; i++) { M.push(new Array(n).fill(Infinity)); hop.push(new Array(n).fill(-Infinity)); }
-      for (i = 0; i < n; i++) for (j = 0; j < n; j++) if (i !== j) { M[i][j] = r.ceil - m.L[p * 2]; p++; }
+      for (i = 0; i < n; i++) for (j = 0; j < n; j++) if (i !== j) { M[i][j] = r.ceil - m.L[p * 2] + gainAt(list[i], brg(list[i], list[j]), m.E[p * 2]) + gainRx(list[j], brg(list[j], list[i]), m.E[p * 2 + 1]); p++; }
       for (i = 0; i < n; i++) for (j = 0; j < n; j++) if (i !== j) hop[i][j] = Math.min(M[i][j], M[j][i]);
       var ch2 = LL.widestChain(hop.map(function (a, u) { return a.map(function (v, w) { return u === w ? -Infinity : v; }); }));
       sim.M = M; sim.hop = hop; sim.par = ch2.par; sim.best = ch2.best;
@@ -170,7 +204,7 @@
         for (var q = 0; q < nn; q++) if (R[q] < best[q]) { best[q] = R[q]; who[q] = u; }
       });
       sim.best2 = best; sim.who = who;
-      var a = 0, cellA = T.cell * T.cell / 1e6, lim = r.ceil - r.fade;
+      var a = 0, cellA = T.cell * T.cell / 1e6, lim = r.ceil - r.fade - S.crewLoss;
       for (var q = 0; q < nn; q++) if (best[q] <= lim) a++;
       sim.area = a * cellA;
       sim.nodeArea = rasters.map(function (R) { var c = 0; for (var w = 0; w < nn; w++) if (R[w] <= lim) c++; return c * cellA; });
@@ -198,12 +232,12 @@
       chunks.push(pool.run({ type: "links", id: q, links: links.slice(a, b), f: r.f }));
     }
     return Promise.all(chunks).then(function (res) {
-      var L = [], i = 0;
-      res.forEach(function (m) { for (var z = 0; z < m.L.length; z += 2) L.push(m.L[z]); });
+      var L = [], E = [], i = 0;
+      res.forEach(function (m) { for (var z = 0; z < m.L.length; z += 2) { L.push(m.L[z]); E.push(m.E[z], m.E[z + 1]); } });
       var best = new Float32Array(ns), out = 0, segs = [], cur = null;
       for (var k2 = 0; k2 < ns; k2++) {
-        var bm = -Infinity;
-        for (var c2 = 0; c2 < conn.length; c2++) { var mg = r.ceil - L[i++]; if (mg > bm) bm = mg; }
+        var bm = -Infinity, pt = { x: tx[k2], y: P.ty[k2] };
+        for (var c2 = 0; c2 < conn.length; c2++) { var s2 = conn[c2].s, bp = brg(s2, pt), mg = r.ceil - L[i] - S.crewLoss + Math.min(gainAt(s2, bp, E[2 * i]), gainRx(s2, bp, E[2 * i])); i++; if (mg > bm) bm = mg; }
         best[k2] = bm;
         if (bm < r.fade) {
           out += P.dt[k2];
@@ -216,14 +250,15 @@
   }
 
   // ---- fewest relays
-  function linkBatch(r, a) {
+  // Losses for a flat list of links, less the antenna gain gf(link, take-off elevation at the start, at the end) when given.
+  function linkBatch(r, a, gf) {
     var n = a.length / 6;
     if (!n) return Promise.resolve(new Float64Array(0));
     var nc = Math.min(pool.n * 3, Math.ceil(n / 64)), jobs = [];
     for (var q = 0; q < nc; q++) jobs.push(pool.run({ type: "links", id: q, links: a.slice(Math.floor(q * n / nc) * 6, Math.floor((q + 1) * n / nc) * 6), f: r.f }));
     return Promise.all(jobs).then(function (res) {
       var L = new Float64Array(n), p = 0;
-      res.forEach(function (m) { for (var z = 0; z < m.L.length; z += 2) L[p++] = m.L[z]; });
+      res.forEach(function (m) { for (var z = 0; z < m.L.length; z += 2) { L[p] = m.L[z] - (gf ? gf(p, m.E[z], m.E[z + 1]) : 0); p++; } });
       return L;
     });
   }
@@ -259,19 +294,20 @@
     srcs.forEach(function (u) { seen[u] = 1; w[u] = Infinity; });
     for (var hop = 1; hop <= MAX_RELAYS + 1 && frontier.length; hop++) {
       onStep(hop);
-      var rest = [], v, o = 0;
+      var rest = [], v, o = 0, nr;
       for (v = 0; v < n; v++) if (!seen[v]) rest.push(v);
-      var a = new Float64Array(frontier.length * rest.length * 6);
+      nr = rest.length;
+      var a = new Float64Array(frontier.length * nr * 6);
       frontier.forEach(function (u) {
         var U = list[u];
         rest.forEach(function (q) { var V = list[q]; a[o++] = U.x; a[o++] = U.y; a[o++] = V.x; a[o++] = V.y; a[o++] = U.h; a[o++] = V.h; });
       });
-      var L = await linkBatch(r, a), keep = [], b = [];
-      for (var i = 0; i < frontier.length; i++) for (var j = 0; j < rest.length; j++) {
-        var mf = r.ceil - L[i * rest.length + j];
+      var L = await linkBatch(r, a, function (p, e1, e2) { return list[frontier[Math.floor(p / nr)]].g(e1) + list[rest[p % nr]].g(e2); }), keep = [], b = [];
+      for (var i = 0; i < frontier.length; i++) for (var j = 0; j < nr; j++) {
+        var mf = r.ceil - L[i * nr + j];
         if (mf >= need) { var U = list[frontier[i]], V = list[rest[j]]; keep.push([frontier[i], rest[j], mf]); b.push(V.x, V.y, U.x, U.y, V.h, U.h); }
       }
-      var Lb = await linkBatch(r, Float64Array.from(b)), fresh = [], end = -1;
+      var Lb = await linkBatch(r, Float64Array.from(b), function (p, e1, e2) { return list[keep[p][1]].g(e1) + list[keep[p][0]].g(e2); }), fresh = [], end = -1;
       keep.forEach(function (e, k) {
         var m = Math.min(e[2], r.ceil - Lb[k]), val = Math.min(w[e[0]], m);
         if (m < need || val <= w[e[1]]) return;
@@ -289,11 +325,12 @@
     }
     return null;
   }
+  function planSite(s) { var r = planRows(s.ant).front; return { x: s.x, y: s.y, h: s.h, g: function (el) { return LL.elGain(r, el); }, c: covG(s.ant) }; }
   async function pointSearch(r, need, h, setStat) {
-    var tg = { x: S.target.x, y: S.target.y, h: S.crew.h }, D = Math.hypot(tg.x - S.base.x, tg.y - S.base.y);
+    var gR = planG(S.relayAnt), tg = { x: S.target.x, y: S.target.y, h: S.crew.h, g: function () { return 0; } }, D = Math.hypot(tg.x - S.base.x, tg.y - S.base.y);
     for (var pass = 0; pass < 2; pass++) {
       var whole = pass === 1, c = candidates(whole ? null : [S.base, tg], Math.max(1500, 0.35 * D), whole ? 700 : 500);
-      var list = [S.base].concat(c.sites.map(function (q) { return { x: q.x, y: q.y, h: h }; }), [tg]), mask = new Uint8Array(list.length);
+      var list = [planSite(S.base)].concat(c.sites.map(function (q) { return { x: q.x, y: q.y, h: h, g: gR }; }), [tg]), mask = new Uint8Array(list.length);
       mask[list.length - 1] = 1;
       var q = await chainSearch(r, need, list, function (hop) { setStat("Searching " + c.sites.length + " sites" + (whole ? " across the whole map" : "") + ", hop " + hop, hop / (MAX_RELAYS + 1)); }, [0], mask);
       if (q) return { mid: q.ids.slice(1, -1).map(function (i) { return list[i]; }), weak: q.weak, last: q.last, count: c.sites.length, spacing: c.spacing, whole: whole, cx: tg.x, cy: tg.y };
@@ -302,11 +339,11 @@
   }
   // Greedy along the route: from the first station out of contact, add the linked site that holds contact farthest, bridging with a fewest-hop chain when none can, then drop any relay the plan does not need.
   async function routeSearch(r, need, h, P, setStat) {
-    var c = candidates(P.way, 2000, 700), list = [S.base].concat(c.sites.map(function (q) { return { x: q.x, y: q.y, h: h }; })), m = list.length, ns = P.tx.length, u, k, o = 0;
+    var gR = planG(S.relayAnt), cR = covG(S.relayAnt), c = candidates(P.way, 2000, 700), list = [planSite(S.base)].concat(c.sites.map(function (q) { return { x: q.x, y: q.y, h: h, g: gR, c: cR }; })), m = list.length, ns = P.tx.length, u, k, o = 0;
     setStat("Checking " + c.sites.length + " sites against " + ns + " route points", 0.1);
     var a = new Float64Array(m * ns * 6);
     for (u = 0; u < m; u++) for (k = 0; k < ns; k++) { a[o++] = list[u].x; a[o++] = list[u].y; a[o++] = P.tx[k]; a[o++] = P.ty[k]; a[o++] = list[u].h; a[o++] = S.crew.h; }
-    var L = await linkBatch(r, a), cov = new Uint8Array(m * ns), any = new Uint8Array(ns), covered = new Uint8Array(ns);
+    var L = await linkBatch(r, a, function (p, e1, e2) { return list[Math.floor(p / ns)].c(e1); }), cov = new Uint8Array(m * ns), any = new Uint8Array(ns), covered = new Uint8Array(ns);
     for (u = 0; u < m; u++) for (k = 0; k < ns; k++) if (r.ceil - L[u * ns + k] >= need) { cov[u * ns + k] = 1; any[k] = 1; }
     var chosen = [], hopM = new Float64Array(m).fill(-Infinity), edge = new Set();
     var addSite = async function (s) {
@@ -314,9 +351,9 @@
       for (var q = 0; q < ns; q++) if (cov[s * ns + q]) covered[q] = 1;
       var A = list[s], f = new Float64Array(m * 6), p = 0, v;
       for (v = 0; v < m; v++) { f[p++] = A.x; f[p++] = A.y; f[p++] = list[v].x; f[p++] = list[v].y; f[p++] = A.h; f[p++] = list[v].h; }
-      var L1 = await linkBatch(r, f), pass = [], b = [];
+      var L1 = await linkBatch(r, f, function (p, e1, e2) { return A.g(e1) + list[p].g(e2); }), pass = [], b = [];
       for (v = 0; v < m; v++) if (v !== s && r.ceil - L1[v] >= need) { pass.push(v); b.push(list[v].x, list[v].y, A.x, A.y, list[v].h, A.h); }
-      var L2 = await linkBatch(r, Float64Array.from(b));
+      var L2 = await linkBatch(r, Float64Array.from(b), function (p, e1, e2) { return list[pass[p]].g(e1) + A.g(e2); });
       pass.forEach(function (w, i) {
         var mg = Math.min(r.ceil - L1[w], r.ceil - L2[i]);
         if (mg < need) return;
@@ -358,6 +395,42 @@
     for (k = 0; k < ns; k++) if (chosen.some(function (y) { return cov[y * ns + k]; })) held++;
     return { mid: chosen.slice(1).map(function (i) { return list[i]; }), count: c.sites.length, spacing: c.spacing, held: 100 * held / ns };
   }
+  // ---- aim: widest-chain tree under planning gains, then each aimable antenna turns to the bearing that best serves its weakest tree neighbor, with a smaller share for the route points or target nearest to it
+  async function aimAll(run) {
+    if (!pool) return null;
+    var list = sites(), n = list.length, r = radio(), i, j;
+    if (n > 1 && list.some(function (s) { return aimable(s.ant); })) {
+      var a = [], ends = [];
+      for (i = 0; i < n; i++) for (j = 0; j < n; j++) if (i !== j) { a.push(list[i].x, list[i].y, list[j].x, list[j].y, list[i].h, list[j].h); ends.push([i, j]); }
+      var L = await linkBatch(r, Float64Array.from(a), function (p, e1, e2) { return planG(list[ends[p][0]].ant)(e1) + planG(list[ends[p][1]].ant)(e2); });
+      var M = list.map(function () { return new Array(n).fill(-Infinity); });
+      ends.forEach(function (e, p) { M[e[0]][e[1]] = r.ceil - L[p]; });
+      var par = LL.widestChain(M.map(function (row, u) { return row.map(function (v, w) { return u === w ? -Infinity : Math.min(v, M[w][u]); }); })).par;
+      var pts = S.plan ? S.plan.tx.map(function (x, q) { return { x: x, y: S.plan.ty[q] }; }) : S.target ? [S.target] : [], serve = list.map(function () { return []; });
+      pts.forEach(function (pt) {
+        var bi = 0, bd = Infinity;
+        list.forEach(function (s, u) { if (u > 0 && par[u] < 0) return; var d = Math.hypot(s.x - pt.x, s.y - pt.y); if (d < bd) { bd = d; bi = u; } });
+        serve[bi].push(brg(list[bi], pt));
+      });
+      list.forEach(function (s, u) {
+        if (!aimable(s.ant)) return;
+        var nb = [], sv = serve[u], A = ANTS[s.ant], best = s.bore, bs = -Infinity;
+        if (par[u] >= 0) nb.push(brg(s, list[par[u]]));
+        list.forEach(function (t, w) { if (par[w] === u) nb.push(brg(s, t)); });
+        if (!nb.length && !sv.length) return;
+        for (var b = 0; b < 360; b += 2) {
+          var mn = nb.length ? Infinity : 0, mean = 0;
+          nb.forEach(function (x) { mn = Math.min(mn, A.gain(x - b, 0)); });
+          sv.forEach(function (x) { mean += A.gain(x - b, 0) / sv.length; });
+          var sc = mn + (nb.length ? 0.3 : 1) * mean;
+          if (sc > bs + 1e-9) { bs = sc; best = b; }
+        }
+        s.bore = best;
+      });
+    }
+    markStale(); renderNodes();
+    return run ? simulate() : null;
+  }
   function setPicking(on) {
     S.picking = on; $("auto").setAttribute("aria-pressed", String(on)); $("app").classList.toggle("placing", on);
     if (on) hintShow("Click the map to set the point."); else $("hint").hidden = true;
@@ -383,11 +456,11 @@
       var n = q.mid.length;
       if (!drawn) S.plan = null;
       S.solo = null; S.sel = null;
-      S.nodes = q.mid.map(function (w, k) { return { id: "R" + (k + 1), x: w.x, y: w.y, h: h }; });
+      S.nodes = q.mid.map(function (w, k) { return relay("R" + (k + 1), w.x, w.y, h); });
       S.seq = n + 1;
       S.auto = drawn ? null : { cx: q.cx, cy: q.cy, from: n ? "R" + n : "B", last: q.last };
       fitPlan(); markStale(); renderPlan(); renderNodes(); renderLegend();
-      return simulate();
+      return aimAll(true);
     }).catch(function (e) {
       done(); banner("The relay search failed: " + e.message + ". Reload the page to try again.");
     });
@@ -516,7 +589,7 @@
     ctx.textAlign = align; ctx.lineWidth = 3; ctx.strokeStyle = "rgba(8,11,14,0.9)"; ctx.strokeText(t, x, y); ctx.fillStyle = color || "#e9ecee"; ctx.fillText(t, x, y);
   }
   function linkLines() {
-    var sim = S.sim; if (!sim) return;
+    var sim = S.sim; if (!sim) { profLine(); return; }
     var L = sim.list, n = L.length, i, j, r = sim.r;
     ctx.save(); if (S.stale) { ctx.setLineDash([6, 5]); ctx.globalAlpha = 0.55; }
     for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) {
@@ -534,6 +607,7 @@
       ctx.lineWidth = 2.5; ctx.strokeStyle = ok ? "#f2f4f5" : MARGINAL_CSS; ctx.stroke();
     }
     ctx.restore();
+    profLine();
     ctx.font = "12px 'B612', 'Segoe UI', sans-serif"; ctx.textBaseline = "middle";
     for (i = 1; i < n; i++) {
       var q = sim.par[i]; if (q < 0) continue;
@@ -567,6 +641,27 @@
     ctx.lineWidth = 2.5; ctx.strokeStyle = "#7fe0c2"; ctx.stroke();
     ctx.font = "12px 'B612', 'Segoe UI', sans-serif"; ctx.textBaseline = "middle";
     halo(A.last.toFixed(0) + " dB", (sx(q.x) + sx(S.target.x)) / 2, (sy(q.y) + sy(S.target.y)) / 2 - 9, "center", "#bff3e2");
+  }
+  var PAT_R = 58;
+  function patR(g) { return PAT_R * Math.pow(10, (g - GREF) / 20); }
+  function handlePos(s) { var t = s.bore * Math.PI / 180, rr = patR(ANTS[s.ant].gain(0, 0)) + 9; return { x: sx(s.x) + rr * Math.sin(t), y: sy(s.y) - rr * Math.cos(t) }; }
+  function patterns() {
+    if (!S.showPat) return;
+    sites().forEach(function (s, i) {
+      var A = ANTS[s.ant]; if (A.iso) return;
+      var x = sx(s.x), y = sy(s.y), d, base = i === 0;
+      ctx.beginPath();
+      for (d = 0; d <= 360; d += 3) { var rr = patR(A.gain(d - s.bore, 0)), t = d * Math.PI / 180, px = x + rr * Math.sin(t), py = y - rr * Math.cos(t); if (d) ctx.lineTo(px, py); else ctx.moveTo(px, py); }
+      ctx.closePath(); ctx.fillStyle = base ? "rgba(230,176,74,0.24)" : "rgba(242,244,245,0.2)"; ctx.fill();
+      ctx.lineWidth = 3.5; ctx.strokeStyle = "rgba(8,11,14,0.55)"; ctx.stroke();
+      ctx.lineWidth = 1.6; ctx.strokeStyle = base ? "#e6b04a" : "#f2f4f5"; ctx.stroke();
+      ctx.beginPath(); ctx.arc(x, y, patR(0), 0, 7); ctx.setLineDash([3, 3]); ctx.lineWidth = 1; ctx.strokeStyle = "rgba(233,236,238,0.6)"; ctx.stroke(); ctx.setLineDash([]);
+      if (aimable(s.ant)) {
+        var h = handlePos(s);
+        ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(h.x, h.y); ctx.lineWidth = 1.5; ctx.strokeStyle = base ? "#e6b04a" : "#f2f4f5"; ctx.stroke();
+        ctx.beginPath(); ctx.arc(h.x, h.y, 5.5, 0, 7); ctx.fillStyle = base ? "#e6b04a" : "#f2f4f5"; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = "#0b0e11"; ctx.stroke();
+      }
+    });
   }
   function nodesDraw() {
     var sim = S.sim, all = sites(), i;
@@ -617,7 +712,7 @@
     ctx.imageSmoothingEnabled = true;
     diskPath(); ctx.lineWidth = 1.5; ctx.strokeStyle = "rgba(233,236,238,0.55)"; ctx.stroke();
     axes();
-    routeLine(); drawPreview(); linkLines(); targetLink(); nodesDraw(); poleMark();
+    routeLine(); drawPreview(); patterns(); linkLines(); targetLink(); nodesDraw(); poleMark();
   }
 
   // ---- interaction
@@ -625,6 +720,7 @@
   function pos(e) { var r = cv.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; }
   function hit(p) {
     var tol = 20;
+    if (S.showPat) { var all = sites(); for (var k = all.length - 1; k >= 0; k--) if (aimable(all[k].ant)) { var hp = handlePos(all[k]); if (Math.hypot(hp.x - p.x, hp.y - p.y) < 10) return { kind: "aim", site: all[k] }; } }
     for (var i = S.nodes.length - 1; i >= 0; i--) if (Math.hypot(sx(S.nodes[i].x) - p.x, sy(S.nodes[i].y) - p.y) < tol) return { kind: "node", node: S.nodes[i] };
     if (Math.hypot(sx(S.base.x) - p.x, sy(S.base.y) - p.y) < tol) return { kind: "base" };
     return null;
@@ -633,7 +729,7 @@
     var dx = q.x - T.bx, dy = q.y - T.by, r = Math.hypot(dx, dy), lim = T.rdisk - 30;
     if (r > lim) { q.x = T.bx + dx * lim / r; q.y = T.by + dy * lim / r; }
   }
-  function markStale() { S.stale = true; S.gen++; $("rd").classList.add("dim"); setChip("Out of date", "stale"); $("stat").textContent = "Press Simulate to update the results."; draw(); }
+  function markStale() { S.stale = true; S.gen++; $("rd").classList.add("dim"); setChip("Out of date", "stale"); $("stat").textContent = "Press Simulate to update the results."; renderProfile(); persist(); draw(); }
   function zoomAt(px, py, f) {
     var x = wx(px), y = wy(py);
     view.s = Math.max(0.01, Math.min(1.6, view.s * f));
@@ -648,9 +744,11 @@
     if (ptrs.size === 2) { var a = Array.from(ptrs.values()); pinch = { d: Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y) }; drag = null; return; }
     if (S.picking) { var tp = { x: wx(p.x), y: wy(p.y) }; clampDisk(tp); S.target = tp; setPicking(false); drag = null; draw(); autoPlan(true); return; }
     if (S.drawing) { var wp = { x: wx(p.x), y: wy(p.y) }; clampDisk(wp); S.draw.push(wp); drag = null; draw(); return; }
+    if (S.probing) { var pq = { x: wx(p.x), y: wy(p.y) }; clampDisk(pq); openProfile(probeFrom(), null, pq); drag = null; return; }
     if (S.placing) { addNode(wx(p.x), wy(p.y)); setPlacing(false); drag = null; return; }
     var h = hit(p);
     if (h && h.kind === "node") { S.sel = h.node; drag = h; renderNodes(); draw(); }
+    else if (h && h.kind === "aim") { drag = h; if (h.site !== S.base) S.sel = h.site; renderNodes(); draw(); }
     else if (h && h.kind === "base") { hintShow("The base stays at the summit. Its mast is set under Sites.", 2500); drag = { kind: "pan", x: p.x, y: p.y, cx: view.cx, cy: view.cy }; }
     else drag = { kind: "pan", x: p.x, y: p.y, cx: view.cx, cy: view.cy };
   });
@@ -674,11 +772,17 @@
       zoomAt((a[0].x + a[1].x) / 2, (a[0].y + a[1].y) / 2, d / pinch.d); pinch.d = d; return;
     }
     if (!drag) return;
+    if (drag.kind === "aim") { var as = drag.site; as.bore = Math.round(LL.bearing(as.x, as.y, wx(p.x), wy(p.y))) % 360; markStale(); renderNodes(); hintShow((as === S.base ? "Base" : as.id) + " antenna toward " + as.bore + "°", 1200); return; }
     if (drag.kind !== "pan") readAt(p.x, p.y, drag.node.id);
     if (drag.kind === "pan") { view.cx = drag.cx - (p.x - drag.x) / view.s; view.cy = drag.cy + (p.y - drag.y) / view.s; clampView(); draw(); }
     else if (drag.kind === "node") { var q = drag.node; q.x = wx(p.x); q.y = wy(p.y); clampDisk(q); markStale(); renderNodes(); }
   });
-  var up = function (e) { ptrs.delete(e.pointerId); if (ptrs.size < 2) pinch = null; if (ptrs.size === 0) drag = null; };
+  var up = function (e) {
+    var d0 = drag; ptrs.delete(e.pointerId); if (ptrs.size < 2) pinch = null;
+    if (ptrs.size !== 0) return;
+    drag = null;
+    if (e.type === "pointerup" && d0 && d0.kind === "pan") { var p = pos(e); if (Math.hypot(p.x - d0.x, p.y - d0.y) < 5) { var lk = hitLink(p); if (lk) openProfile(lk.a, lk.b); } }
+  };
   cv.addEventListener("pointerup", up); cv.addEventListener("pointercancel", up);
   cv.addEventListener("wheel", function (e) { e.preventDefault(); var p = pos(e); zoomAt(p.x, p.y, Math.exp(-e.deltaY * 0.0014)); }, { passive: false });
   cv.addEventListener("dblclick", function (e) { if (S.drawing) { finishDraw(); return; } var p = pos(e); if (!hit(p)) addNode(wx(p.x), wy(p.y)); });
@@ -687,7 +791,7 @@
   function hintShow(t, ms) { var h = $("hint"); h.textContent = t; h.hidden = false; clearTimeout(hintT); if (ms) hintT = setTimeout(function () { h.hidden = true; }, ms); }
   function addNode(x, y) {
     if (S.nodes.length >= MAX_RELAYS) { hintShow("Twelve relays is the limit here.", 2500); return; }
-    var q = { id: "R" + S.seq++, x: x, y: y, h: 1.5 }; clampDisk(q); S.nodes.push(q); S.sel = q; markStale(); renderNodes();
+    var q = relay("R" + S.seq++, x, y, 1.5); clampDisk(q); S.nodes.push(q); S.sel = q; markStale(); renderNodes();
   }
   function renumber() { S.nodes.forEach(function (q, i) { q.id = "R" + (i + 1); }); S.seq = S.nodes.length + 1; }
 
@@ -698,7 +802,7 @@
     var r = radio();
     $("budget-note").textContent = "Allowed loss " + (r.ceil - r.fade).toFixed(1) + " dB";
     $("freq-v").textContent = fmtF(r.fMHz);
-    $("target-wrap").hidden = S.preset !== "free";
+    $("rate-target-wrap").hidden = S.preset !== "free";
   }
   function renderResult() {
     var sim = S.sim; if (!sim) return;
@@ -750,6 +854,17 @@
       x.appendChild(rm);
     }
     c.appendChild(x); d.appendChild(c);
+    var ar = document.createElement("div"), nm = i === 0 ? "the base" : q.id; ar.className = "antrow";
+    var se = document.createElement("select"); se.setAttribute("aria-label", "Antenna of " + nm);
+    antOptions(se); se.value = q.ant;
+    se.addEventListener("change", function () { q.ant = se.value; markStale(); renderNodes(); renderLegend(); renderAnt(i === 0 ? "Base" : q.id, q.ant); });
+    ar.appendChild(se);
+    var bi = document.createElement("input"); bi.type = "number"; bi.min = 0; bi.max = 359; bi.step = 1; bi.value = Math.round(q.bore); bi.disabled = ANTS[q.ant].meta.family === "omni";
+    bi.setAttribute("aria-label", "Antenna bearing of " + nm + " in degrees clockwise from map up");
+    bi.addEventListener("change", function () { var v = parseFloat(bi.value); if (isFinite(v)) { q.bore = ((Math.round(v) % 360) + 360) % 360; markStale(); } bi.value = q.bore; });
+    ar.appendChild(bi);
+    var dg = document.createElement("span"); dg.textContent = "° aim"; ar.appendChild(dg);
+    d.appendChild(ar);
     return d;
   }
   function renderNodes() { var e = $("nodes"); e.innerHTML = ""; sites().forEach(function (q, i) { e.appendChild(nodeCard(q, i)); }); }
@@ -762,10 +877,10 @@
       rows.push({ i: i, j: j, a: a, b: b, m: m, chain: sim.par[i] === j || sim.par[j] === i });
     }
     rows.sort(function (u, v) { return (v.chain - u.chain) || (v.m - u.m); });
-    var h = "<table><thead><tr><th scope=\"col\">Link</th><th scope=\"col\">Forward dB</th><th scope=\"col\">Back dB</th><th scope=\"col\">Rate</th><th scope=\"col\">State</th></tr></thead><tbody>";
+    var h = "<table><thead><tr><th scope=\"col\">Link</th><th scope=\"col\">Forward dB</th><th scope=\"col\">Back dB</th><th scope=\"col\">Rate</th><th scope=\"col\">State</th><th scope=\"col\"><span class=\"vh\">Profile</span></th></tr></thead><tbody>";
     rows.forEach(function (q) {
       var A = sim.list[q.i].id, B = sim.list[q.j].id, ok = q.m >= r.fade;
-      h += "<tr><td>" + A + "–" + B + (q.chain ? " chain" : "") + "</td><td>" + db(q.a) + "</td><td>" + db(q.b) + "</td><td>" + fmtRate(r.rate(r.ceil - q.m)) + "</td><td>" + (ok ? "● reliable" : q.m >= 0 ? "▲ marginal" : "✕ down") + "</td></tr>";
+      h += "<tr><td>" + A + "–" + B + (q.chain ? " chain" : "") + "</td><td>" + db(q.a) + "</td><td>" + db(q.b) + "</td><td>" + fmtRate(r.rate(r.ceil - q.m)) + "</td><td>" + (ok ? "● reliable" : q.m >= 0 ? "▲ marginal" : "✕ down") + "</td><td><button class=\"btn lk\" type=\"button\" data-a=\"" + sim.list[q.i].id + "\" data-b=\"" + sim.list[q.j].id + "\" aria-label=\"Profile of " + A + "–" + B + "\">Profile</button></td></tr>";
     });
     e.innerHTML = rows.length ? h + "</tbody></table>" : "<p class=\"st\">No two sites can reach each other at this budget.</p>";
   }
@@ -784,10 +899,425 @@
       h += "<b>Sunlight, lunar days 6 and 7, 1.5 m</b>" + sw("linear-gradient(90deg,#3a2a10,#ffb028,#ffecaa)", "0 to 100 % of the time");
     } else h += "<b>Terrain</b><div>5 m hillshade, 16 km disk</div>";
     if ($("t-psr").checked) h += sw("#7c5cd6", "PSRs");
+    if (S.showPat && sites().some(function (q) { return !ANTS[q.ant].iso; })) h += "<div class=\"opt\">Antenna shape: gain at the horizon, radius in proportion to free-space range. Dashed ring: 0 dBi." + (sites().some(function (q) { return aimable(q.ant); }) ? " Drag the dot to aim." : "") + "</div>";
     if (S.plan && $("t-route").checked) h += "<div class=\"opt\"><i style=\"background:#7fe0c2\"></i>Route, in contact</div><div class=\"opt\"><i style=\"background:#f0584a\"></i>Route, contact lost</div>";
     e.innerHTML = h;
   }
+  function antOptions(sel) {
+    sel.innerHTML = "";
+    ALIB.antennas.forEach(function (a) { var o = document.createElement("option"); o.value = a.id; o.textContent = a.label; sel.appendChild(o); });
+  }
+  function antLine(id) {
+    var A = ANTS[id], m = A.meta; if (A.iso) return "Isotropic: 0 dBi everywhere, the study's assumption.";
+    var t = m.label + ": " + db(m.peak_dbi !== undefined ? m.peak_dbi : A.max) + " dBi peak, " + db(A.gain(180, 0)) + " dBi at the back, " + db(m.horizon_min_dbi) + " dBi worst at the horizon";
+    if (m.hpbw_az_deg) t += ", " + Math.round(m.hpbw_az_deg) + "° wide";
+    if (m.hpbw_el_deg) t += ", " + Math.round(m.hpbw_el_deg) + "° tall";
+    t += ". " + (m.size ? m.size + ". " : "") + (m.notes || "");
+    if (m.beams > 1) t += " Takes the best of " + m.beams + " beam states.";
+    return t;
+  }
+  function polar(c, ox, oy, R, fn, title) {
+    var lo = -20, hi = Math.max(12, Math.ceil(GREF)), k = function (g) { return R * Math.max(0, g - lo) / (hi - lo); };
+    c.strokeStyle = "rgba(233,236,238,0.22)"; c.lineWidth = 1; c.fillStyle = "#9aa3ab"; c.font = "10px 'B612', 'Segoe UI', sans-serif"; c.textAlign = "left"; c.textBaseline = "middle";
+    [-10, 0, 10].forEach(function (g) { if (g > hi) return; c.beginPath(); c.arc(ox, oy, k(g), 0, 7); c.stroke(); c.fillText(g + "", ox + 2, oy - k(g) + 6); });
+    c.beginPath(); c.moveTo(ox - R, oy); c.lineTo(ox + R, oy); c.moveTo(ox, oy - R); c.lineTo(ox, oy + R); c.stroke();
+    fn(k);
+    c.fillStyle = "#e9ecee"; c.textAlign = "center"; c.fillText(title, ox, oy + R + 11);
+  }
+  // Preview of the antenna last chosen anywhere on the page: the base, all relays, or one site.
+  function renderAnt(who, pick) {
+    if (who) S.prev = { who: who, id: pick };
+    var cv2 = $("antprev"), c = cv2.getContext("2d"), id = S.prev.id, A = ANTS[id], D = ANTS.dipole, w = cv2.width, h = cv2.height, R = Math.min(w / 4, h / 2 - 12) - 6;
+    c.setTransform(1, 0, 0, 1, 0, 0); c.clearRect(0, 0, w, h);
+    var trace = function (k, g, color, dash, fill) {
+      c.beginPath(); for (var d = 0; d <= 360; d += 2) { var rr = k(g(d)), t = d * Math.PI / 180, px = rr * Math.sin(t), py = -rr * Math.cos(t); if (d) c.lineTo(px, py); else c.moveTo(px, py); }
+      c.closePath(); if (fill) { c.fillStyle = fill; c.fill(); } c.setLineDash(dash || []); c.lineWidth = 1.6; c.strokeStyle = color; c.stroke(); c.setLineDash([]);
+    };
+    polar(c, w / 4, h / 2 - 6, R, function (k) {
+      c.save(); c.translate(w / 4, h / 2 - 6);
+      if (D) trace(k, function (d) { return D.gain(d, 0); }, "rgba(233,236,238,0.7)", [3, 3]);
+      trace(k, function (d) { return A.gain(d, 0); }, "#7fe0c2", null, "rgba(127,224,194,0.18)");
+      c.restore();
+    }, "Horizon, boresight up");
+    polar(c, 3 * w / 4, h / 2 - 6, R, function (k) {
+      c.save(); c.translate(3 * w / 4, h / 2 - 6);
+      var cut = function (X) { return function (d) { var e = 90 - (d <= 180 ? d : 360 - d); return X.gain(d <= 180 ? 0 : 180, e); }; };
+      if (D) trace(k, cut(D), "rgba(233,236,238,0.7)", [3, 3]);
+      trace(k, cut(A), "#7fe0c2", null, "rgba(127,224,194,0.18)");
+      c.restore();
+    }, "Vertical, front right");
+    $("ant-note").textContent = S.prev.who + ". " + antLine(id) + " Dashed: half-wave dipole. Rings at −10, 0 and +10 dBi.";
+    cv2.setAttribute("aria-label", "Horizon and vertical pattern of the " + S.prev.who.toLowerCase() + " antenna, " + A.meta.label + ", against a half-wave dipole");
+  }
   function renderAll() { renderValid(); renderResult(); renderPlan(); renderNodes(); renderLinks(); renderLegend(); }
+  // ---- link profile: terrain in the model's curvature frame, the direct ray and first Fresnel zone, the obstacles the hybrid rounds, and the budget both ways
+  var PARAMS = {}, DEGR = 180 / Math.PI;
+  function paramsFor(f) { return PARAMS[f] || (PARAMS[f] = new LL.Params(f)); }
+  function siteById(id) { return sites().filter(function (q) { return q.id === id; })[0] || null; }
+  function siteName(q) { return q.crew ? "Crew" : q === S.base ? "Base" : q.id; }
+  function openProfile(a, b, pt) {
+    S.prof = { a: a, b: b || null, pt: pt || null, swap: false }; S.profHover = null; setProbing(false);
+    renderProfile(); draw();
+  }
+  function closeProfile() { S.prof = null; S.profData = null; S.profHover = null; $("prof").hidden = true; $("wrap").classList.remove("has-prof"); draw(); }
+  function profEnds() {
+    var P = S.prof; if (!P) return null;
+    var a = siteById(P.a); if (!a) return null;
+    var b = P.pt ? { id: "Crew", crew: true, x: P.pt.x, y: P.pt.y, h: S.crew.h, ant: "iso", bore: 0 } : siteById(P.b);
+    if (!b || b === a) return null;
+    return P.swap ? [b, a] : [a, b];
+  }
+  function endGain(q, toward, el, rx) { return q.crew ? -S.crewLoss : rx ? gainRx(q, brg(q, toward), el) : gainAt(q, brg(q, toward), el); }
+  function computeProfile() {
+    var e = profEnds(); if (!e || !ter) return null;
+    var A = e[0], B = e[1], r = radio(), p = paramsFor(r.f), q = ter.profile(A.x, A.y, B.x, B.y, ter.cell);
+    if (q.D < 1) return null;
+    var fw = LL.hybridProfile(q.z, q.N, q.D, A.h, B.h, p, false), runs = fw.runs.slice();
+    var bk = LL.linkLoss(ter, B.x, B.y, A.x, A.y, B.h, A.h, p, false);
+    var st = q.D / (q.N - 1), ze = new Float64Array(q.N), lam = LL.C0 / r.f, minC = Infinity, minAt = 0, i;
+    for (i = 0; i < q.N; i++) { var d = i * st; ze[i] = q.z[i] + d * (q.D - d) / (2 * LL.R_MOON); }
+    for (i = 1; i < q.N - 1; i++) {
+      var dd = i * st, ray = fw.hts + (fw.hrs - fw.hts) * dd / q.D, c = (ray - ze[i]) / Math.sqrt(lam * dd * (q.D - dd) / q.D);
+      if (c < minC) { minC = c; minAt = i; }
+    }
+    var gA = endGain(A, B, fw.elT, false), gB = endGain(B, A, fw.elR, true), gB2 = endGain(B, A, bk.elT, false), gA2 = endGain(A, B, bk.elR, true);
+    return {
+      A: A, B: B, r: r, z: q.z, ze: ze, N: q.N, D: q.D, st: st, lam: lam, fw: fw, bk: bk, runs: runs, gA: gA, gB: gB, gA2: gA2, gB2: gB2,
+      fwd: r.ceil - fw.L + gA + gB, back: r.ceil - bk.L + gB2 + gA2, minC: minC, minAt: minAt,
+      hybrid: fw.los ? NaN : fw.fspl + fw.A_obs + fw.A_tx + fw.A_rx
+    };
+  }
+  function marginClass(m, r) { return m >= r.fade ? "good" : m >= 0 ? "warn" : "bad"; }
+  function renderProfile() {
+    if (!S.prof) return;
+    if (!profEnds()) { closeProfile(); return; }
+    var D = computeProfile(); if (!D) return;
+    S.profData = D;
+    var el = $("prof"), fw = D.fw, r = D.r, a = siteName(D.A), b = siteName(D.B), km = (D.D / 1000).toFixed(2) + " km";
+    el.hidden = false; $("wrap").classList.add("has-prof");
+    $("prof-t").textContent = a + " → " + b;
+    $("prof-s").textContent = fw.los
+      ? km + ", line of sight; tightest clearance " + D.minC.toFixed(2) + " of the first Fresnel zone at " + (D.minAt * D.st / 1000).toFixed(2) + " km"
+      : km + ", diffracted over " + (D.runs.length === 1 ? "1 rounded obstacle" : D.runs.length + " rounded obstacles") + ", bending " + (fw.theta * DEGR).toFixed(2) + "° in all";
+    var row = function (k, v, cls) { return "<tr" + (cls ? " class=\"" + cls + "\"" : "") + "><th scope=\"row\">" + k + "</th><td>" + v + "</td></tr>"; };
+    var h = "<table><tbody>" + row("Free space", db(fw.fspl) + " dB");
+    if (fw.los) h += row("Fresnel obstruction, P.526", db(fw.Ld) + " dB");
+    else {
+      var useH = fw.L > fw.L526 + 1e-9, off = useH ? "" : "off";
+      h += row("Knife edge", db(fw.A_obs - fw.T) + " dB", off) + row("Rounded obstacles", db(fw.T) + " dB", off) +
+        row("Ground near " + a, db(fw.A_tx) + " dB", off) + row("Ground near " + b, db(fw.A_rx) + " dB", off) +
+        row("Hybrid" + (useH ? ", used" : ""), db(D.hybrid) + " dB", off) + row("P.526 general" + (useH ? "" : ", used"), db(fw.L526) + " dB", useH ? "off" : "");
+    }
+    h += row("Path loss", db(fw.L) + " dB", "tot");
+    h += row(a + " antenna", D.A.crew ? sign(D.gA) + " dB, crew" : sign(D.gA) + " dBi at " + sign(fw.elT) + "°");
+    h += row(b + " antenna", D.B.crew ? sign(D.gB) + " dB, crew" : sign(D.gB) + " dBi at " + sign(fw.elR) + "°");
+    h += row("Budget", db(r.ceil) + " dB");
+    h += "<tr class=\"tot\"><th scope=\"row\">Margin " + a + " → " + b + "</th><td class=\"" + marginClass(D.fwd, r) + "\">" + db(D.fwd) + " dB</td></tr>";
+    h += "<tr><th scope=\"row\">Margin " + b + " → " + a + "</th><td class=\"" + marginClass(D.back, r) + "\">" + db(D.back) + " dB</td></tr>";
+    var m = Math.min(D.fwd, D.back), state = m >= r.fade ? "● reliable" : m >= 0 ? "▲ marginal" : "✕ down";
+    $("prof-m").innerHTML = "<span class=\"" + marginClass(m, r) + "\">" + state + ", margin " + db(D.fwd) + " / " + db(D.back) + " dB</span>";
+    h += row("State", m >= r.fade ? "● reliable" : m >= 0 ? "▲ marginal" : "✕ down") + row("Needs", db(r.fade) + " dB fade margin") + row("Rate", fmtRate(r.rate(r.ceil - m)));
+    h += "</tbody></table><p>Terrain includes the Moon's curvature, as the model sees it. Shaded: first Fresnel zone. Gold: what the model treats as rounded obstacles. Dashed: the diffracted path. Estimates are about ±" + (fw.los ? "3" : "7") + " dB against the PE.</p>";
+    $("prof-k").innerHTML = h;
+    $("wrap").style.setProperty("--prof-h", el.offsetHeight + "px");
+    drawProfile();
+  }
+  function profTicks(a, b, n) {
+    var s = (b - a) / n, p = Math.pow(10, Math.floor(Math.log10(s))), f = s / p, step = (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * p, out = [];
+    for (var v = Math.ceil(a / step) * step; v <= b + 1e-9; v += step) out.push(v);
+    return out;
+  }
+  function profGeom() {
+    var D = S.profData, c = $("prof-cv"), w = c.clientWidth, h = c.clientHeight, fw = D.fw;
+    var L = 54, R = 12, Tp = 18, B = 22, pw = w - L - R, ph = h - Tp - B;
+    var ray = function (d) { return fw.hts + (fw.hrs - fw.hts) * d / D.D; }, f1 = function (d) { return Math.sqrt(D.lam * d * Math.max(D.D - d, 0) / D.D); };
+    var lo = Infinity, hi = -Infinity, i;
+    for (i = 0; i < D.N; i++) { var d = i * D.st, rr = ray(d), ff = f1(d); lo = Math.min(lo, D.ze[i], rr - ff); hi = Math.max(hi, D.ze[i], rr + ff); }
+    hi = Math.max(hi, fw.hts, fw.hrs);
+    var apex = fw.los ? null : { d: fw.db, y: fw.hts + fw.Stim * fw.db };
+    if (apex) hi = Math.max(hi, apex.y);
+    var pad = (hi - lo) * 0.08 + 2; lo -= pad; hi += pad;
+    return { w: w, h: h, L: L, R: R, Tp: Tp, B: B, pw: pw, ph: ph, lo: lo, hi: hi, ray: ray, f1: f1, apex: apex,
+      X: function (d) { return L + pw * d / D.D; }, Y: function (y) { return Tp + ph * (hi - y) / (hi - lo); } };
+  }
+  function drawProfile() {
+    var D = S.profData, c = $("prof-cv"); if (!D || $("prof").hidden) return;
+    var w = c.clientWidth, h = c.clientHeight; if (!w || !h) return;
+    var k = Math.min(window.devicePixelRatio || 1, 2);
+    if (c.width !== Math.round(w * k) || c.height !== Math.round(h * k)) { c.width = Math.round(w * k); c.height = Math.round(h * k); }
+    var g = c.getContext("2d"); g.setTransform(k, 0, 0, k, 0, 0); g.clearRect(0, 0, w, h);
+    var G = profGeom(); if (G.pw < 40 || G.ph < 30) return;
+    var fw = D.fw, X = G.X, Y = G.Y, N = D.N, st = D.st, i, d;
+    g.font = "10px 'B612', 'Segoe UI', sans-serif"; g.textBaseline = "middle"; g.lineWidth = 1;
+    profTicks(G.lo, G.hi, Math.max(2, Math.floor(G.ph / 34))).forEach(function (v) {
+      g.strokeStyle = "rgba(233,236,238,0.08)"; g.beginPath(); g.moveTo(G.L, Y(v)); g.lineTo(G.L + G.pw, Y(v)); g.stroke();
+      g.fillStyle = "#8f98a0"; g.textAlign = "right"; g.fillText(Math.round(v) + "", G.L - 6, Y(v));
+    });
+    g.textBaseline = "top";
+    profTicks(0, D.D / 1000, Math.max(2, Math.floor(G.pw / 70))).forEach(function (v) {
+      g.strokeStyle = "rgba(233,236,238,0.08)"; g.beginPath(); g.moveTo(X(v * 1000), G.Tp); g.lineTo(X(v * 1000), G.Tp + G.ph); g.stroke();
+      g.fillStyle = "#8f98a0"; g.textAlign = "center"; g.fillText(+v.toFixed(2) + (v === 0 ? " km" : ""), X(v * 1000), G.Tp + G.ph + 5);
+    });
+    g.save(); g.translate(12, G.Tp + G.ph / 2); g.rotate(-Math.PI / 2); g.textAlign = "center"; g.textBaseline = "middle"; g.fillStyle = "#8f98a0"; g.fillText("height, m", 0, 0); g.restore();
+    g.beginPath();
+    for (i = 0; i < N; i++) { d = i * st; g.lineTo(X(d), Y(G.ray(d) + G.f1(d))); }
+    for (i = N - 1; i >= 0; i--) { d = i * st; g.lineTo(X(d), Y(G.ray(d) - G.f1(d))); }
+    g.closePath(); g.fillStyle = "rgba(127,224,194,0.13)"; g.fill();
+    g.setLineDash([3, 3]); g.strokeStyle = "rgba(127,224,194,0.5)"; g.stroke(); g.setLineDash([]);
+    g.beginPath(); g.moveTo(X(0), Y(G.lo));
+    for (i = 0; i < N; i++) g.lineTo(X(i * st), Y(D.ze[i]));
+    g.lineTo(X(D.D), Y(G.lo)); g.closePath(); g.fillStyle = "#3b434b"; g.fill();
+    g.beginPath(); for (i = 0; i < N; i++) g.lineTo(X(i * st), Y(D.ze[i])); g.strokeStyle = "#aab2b9"; g.lineWidth = 1.2; g.stroke();
+    D.runs.forEach(function (rn) {
+      g.beginPath(); for (var j = rn.i0; j <= rn.i1; j++) g.lineTo(X(j * st), Y(D.ze[j]));
+      g.lineWidth = 3.5; g.strokeStyle = "#e6b04a"; g.lineCap = "round"; g.stroke(); g.lineCap = "butt";
+      if (rn.i0 === rn.i1) { g.beginPath(); g.arc(X(rn.i0 * st), Y(D.ze[rn.i0]), 3, 0, 7); g.fillStyle = "#e6b04a"; g.fill(); }
+    });
+    g.lineWidth = 1.6; g.strokeStyle = "#f2f4f5"; g.beginPath(); g.moveTo(X(0), Y(fw.hts)); g.lineTo(X(D.D), Y(fw.hrs)); g.stroke();
+    g.strokeStyle = "#f0584a"; g.lineWidth = 2.2;
+    for (i = 1; i < N - 1; i++) {
+      d = i * st;
+      if (D.ze[i] > G.ray(d)) { var d0 = (i - 0.5) * st, d1 = (i + 0.5) * st; g.beginPath(); g.moveTo(X(d0), Y(G.ray(d0))); g.lineTo(X(d1), Y(G.ray(d1))); g.stroke(); }
+    }
+    if (G.apex) {
+      g.setLineDash([6, 4]); g.lineWidth = 1.6; g.strokeStyle = "#ffd640";
+      g.beginPath(); g.moveTo(X(0), Y(fw.hts)); g.lineTo(X(G.apex.d), Y(G.apex.y)); g.lineTo(X(D.D), Y(fw.hrs)); g.stroke(); g.setLineDash([]);
+    }
+    [[0, D.ze[0], fw.hts, siteName(D.A), "left"], [D.D, D.ze[N - 1], fw.hrs, siteName(D.B), "right"]].forEach(function (m) {
+      g.strokeStyle = "#f2f4f5"; g.lineWidth = 2; g.beginPath(); g.moveTo(X(m[0]), Y(m[1])); g.lineTo(X(m[0]), Y(m[2])); g.stroke();
+      g.beginPath(); g.arc(X(m[0]), Y(m[2]), 3.5, 0, 7); g.fillStyle = "#f2f4f5"; g.fill();
+      g.font = "600 12px 'Saira Semi Condensed', 'Segoe UI', sans-serif"; g.textBaseline = "bottom"; g.textAlign = m[4]; g.fillStyle = "#f2f4f5";
+      g.fillText(m[3], X(m[0]) + (m[4] === "left" ? 4 : -4), Y(m[2]) - 5);
+    });
+    var ex = (G.ph / (G.hi - G.lo)) / (G.pw / D.D);
+    g.font = "10px 'B612', 'Segoe UI', sans-serif"; g.textBaseline = "top"; g.textAlign = "right"; g.fillStyle = "#8f98a0";
+    g.fillText("vertical ×" + (ex >= 10 ? Math.round(ex) : ex.toFixed(1)), G.L + G.pw, 3);
+    if (S.profHover !== null) {
+      var hi2 = S.profHover; d = hi2 * st;
+      g.strokeStyle = "rgba(242,244,245,0.6)"; g.lineWidth = 1; g.beginPath(); g.moveTo(X(d), G.Tp); g.lineTo(X(d), G.Tp + G.ph); g.stroke();
+      g.beginPath(); g.arc(X(d), Y(D.ze[hi2]), 3, 0, 7); g.fillStyle = "#aab2b9"; g.fill();
+      g.beginPath(); g.arc(X(d), Y(G.ray(d)), 3, 0, 7); g.fillStyle = "#f2f4f5"; g.fill();
+    }
+  }
+  function profRead(i) {
+    var D = S.profData, e = $("prof-read");
+    if (!D || i === null) { e.hidden = true; return; }
+    var d = i * D.st, ray = D.fw.hts + (D.fw.hrs - D.fw.hts) * d / D.D, f1 = Math.sqrt(D.lam * d * Math.max(D.D - d, 0) / D.D), gap = ray - D.ze[i];
+    var t = (d / 1000).toFixed(2) + " km: ground " + Math.round(D.z[i]) + " m (" + Math.round(D.ze[i]) + " m with curvature), ray " + Math.round(ray) + " m, ";
+    t += gap < 0 ? "ray " + db(-gap) + " m below the ground" : f1 > 0.01 ? "clearance " + (gap / f1).toFixed(2) + " of the first Fresnel zone" : "at the end";
+    e.textContent = t; e.hidden = false;
+  }
+  function profLine() {
+    var D = S.profData; if (!D || !S.prof) return;
+    var a = D.A, b = D.B;
+    ctx.beginPath(); ctx.moveTo(sx(a.x), sy(a.y)); ctx.lineTo(sx(b.x), sy(b.y));
+    ctx.lineWidth = 7; ctx.strokeStyle = "rgba(8,11,14,0.75)"; ctx.stroke();
+    ctx.lineWidth = 3; ctx.strokeStyle = "#e6b04a"; ctx.stroke();
+    var c = a.crew ? a : b.crew ? b : null;
+    if (c) { ctx.beginPath(); ctx.arc(sx(c.x), sy(c.y), 6, 0, 7); ctx.fillStyle = "#0b0e11"; ctx.fill(); ctx.lineWidth = 2.5; ctx.strokeStyle = "#e6b04a"; ctx.stroke(); }
+    if (S.profHover !== null) {
+      var t = S.profHover / (D.N - 1);
+      ctx.beginPath(); ctx.arc(sx(a.x + (b.x - a.x) * t), sy(a.y + (b.y - a.y) * t), 4.5, 0, 7); ctx.fillStyle = "#f2f4f5"; ctx.fill(); ctx.lineWidth = 1.5; ctx.strokeStyle = "#0b0e11"; ctx.stroke();
+    }
+  }
+  function hitLink(p) {
+    var sim = S.sim; if (!sim) return null;
+    var L = sim.list, n = L.length, best = null, bd = 7;
+    for (var i = 0; i < n; i++) for (var j = i + 1; j < n; j++) {
+      if (!(sim.hop[i][j] >= 0) && !(sim.par[i] === j || sim.par[j] === i)) continue;
+      var ax = sx(L[i].x), ay = sy(L[i].y), vx = sx(L[j].x) - ax, vy = sy(L[j].y) - ay, l2 = vx * vx + vy * vy; if (l2 < 1) continue;
+      var t = Math.max(0, Math.min(1, ((p.x - ax) * vx + (p.y - ay) * vy) / l2)), dd = Math.hypot(p.x - ax - t * vx, p.y - ay - t * vy);
+      if (dd < bd) { bd = dd; best = { a: L[i].id, b: L[j].id }; }
+    }
+    return best;
+  }
+  function probeFrom() { return S.sel && siteById(S.sel.id) ? S.sel.id : S.base.id; }
+  function setProbing(on) {
+    S.probing = on; $("probe").setAttribute("aria-pressed", String(on)); $("app").classList.toggle("placing", on || S.placing || S.drawing || S.picking);
+    if (on) hintShow("Tap the map: profile from " + siteName(siteById(probeFrom())) + " to that point at crew height."); else if (!S.placing && !S.drawing && !S.picking) $("hint").hidden = true;
+  }
+  (function () {
+    var pc = $("prof-cv");
+    pc.addEventListener("pointermove", function (e) {
+      var D = S.profData; if (!D) return;
+      var G = profGeom(), r = pc.getBoundingClientRect(), d = (e.clientX - r.left - G.L) / G.pw * D.D;
+      if (d < 0 || d > D.D) { S.profHover = null; profRead(null); } else { S.profHover = Math.round(d / D.st); profRead(S.profHover); }
+      drawProfile(); draw();
+    });
+    pc.addEventListener("pointerleave", function () { S.profHover = null; profRead(null); drawProfile(); draw(); });
+    $("prof-x").addEventListener("click", closeProfile);
+    $("prof-swap").addEventListener("click", function () { if (!S.prof) return; S.prof.swap = !S.prof.swap; S.profHover = null; profRead(null); renderProfile(); draw(); });
+    $("probe").addEventListener("click", function () { setPlacing(false); if (S.drawing) setDrawing(false); setPicking(false); setProbing(!S.probing); });
+    $("links").addEventListener("click", function (e) { var b = e.target.closest("button[data-a]"); if (b) openProfile(b.getAttribute("data-a"), b.getAttribute("data-b")); });
+  })();
+
+  // ---- save, share and export: the plan in the page link and this browser, and a scenario JSON that terrain-sims/models/linktable.py builds a mesh-simulator link table from
+  var STORE_KEY = "malapert-planner-v1", persistT = 0, applying = false;
+  var LORA_IDS = ["sf12_62", "sf12_125", "sf9", "sf7_125", "sf7_500", "l24_7", "l24_5"];
+  function r1(v) { return Math.round(v * 10) / 10; }
+  function siteState(q, withXY) {
+    var o = withXY ? { x: r1(q.x), y: r1(q.y) } : {};
+    o.h = q.h; o.ant = q.ant; o.bore = Math.round(q.bore || 0);
+    if (q.tilt) { o.tilt = q.tilt; o.tiltAz = q.tiltAz || 0; }
+    return o;
+  }
+  function planState() {
+    var P = S.plan, pi = P && !P.drawn ? PLANS.indexOf(P) : -1;
+    return {
+      v: 1, plan: pi >= 0 ? pi : null, way: P && P.drawn ? P.way.map(function (w) { return [r1(w.x), r1(w.y)]; }) : null,
+      base: siteState(S.base, false), relays: S.nodes.map(function (q) { return siteState(q, true); }), relayAnt: S.relayAnt, rx: S.rxMode,
+      preset: S.preset, f: r1(S.fMHz), rate: S.rateTarget, fade: S.fade, crew: S.crew.h, ov: S.overlay,
+      psr: $("t-psr").checked, route: $("t-route").checked, pat: S.showPat
+    };
+  }
+  function enc(o) {
+    var b = new TextEncoder().encode(JSON.stringify(o)), s = "";
+    for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function dec(t) {
+    var s = atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)), b = new Uint8Array(s.length);
+    for (var i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
+    return JSON.parse(new TextDecoder().decode(b));
+  }
+  function fromHash() { var m = /[#&]p=([A-Za-z0-9_-]+)/.exec(location.hash); if (!m) return null; try { return dec(m[1]); } catch (e) { return { bad: true }; } }
+  function fromStore() { try { var t = localStorage.getItem(STORE_KEY); return t ? JSON.parse(t) : null; } catch (e) { return null; } }
+  function persist(now) {
+    if (applying) return;
+    clearTimeout(persistT);
+    var go = function () {
+      var st = planState();
+      try { history.replaceState(null, "", location.pathname + location.search + "#p=" + enc(st)); } catch (e) { }
+      try { localStorage.setItem(STORE_KEY, JSON.stringify(st)); } catch (e) { }
+    };
+    if (now) go(); else persistT = setTimeout(go, 400);
+  }
+  function num(v, lo, hi, d) { v = +v; return isFinite(v) && v >= lo && v <= hi ? v : d; }
+  function antId(a, d) { return typeof a === "string" && ANTS[a] ? a : d; }
+  function applySite(q, o) {
+    q.h = num(o.h, 0.5, 30, 1.5); q.ant = antId(o.ant, q.ant); q.bore = ((Math.round(num(o.bore, -720, 720, 0)) % 360) + 360) % 360;
+    if (o.tilt) { q.tilt = num(o.tilt, 0, 45, 0); q.tiltAz = num(o.tiltAz, -360, 360, 0); } else { delete q.tilt; delete q.tiltAz; }
+  }
+  function syncControls() {
+    $("preset").value = S.preset; $("freq").value = fToSlider(S.fMHz); $("rate-target").value = String(S.rateTarget); $("budget").value = String(S.fade);
+    $("crewh").value = S.crew.h; $("ant-base").value = S.base.ant; $("ant-relay").value = S.relayAnt; $("ant-rx").value = S.rxMode; $("t-pat").checked = S.showPat;
+    document.querySelectorAll("input[name=ov]").forEach(function (e) { e.checked = e.value === S.overlay; });
+  }
+  function applyState(st, run) {
+    if (!st || typeof st !== "object" || st.v !== 1) throw new Error("not a version 1 planner state");
+    var cut = false;
+    applying = true;
+    try {
+      if (S.drawing) setDrawing(false);
+      setPlacing(false); setPicking(false); setProbing(false);
+      S.auto = null; S.target = null; S.solo = null; S.sel = null; S.plan = null;
+      var way = Array.isArray(st.way) ? st.way.map(function (w) { return { x: +w[0], y: +w[1] }; }).filter(function (w) { return isFinite(w.x) && isFinite(w.y); }) : [];
+      if (way.length >= 2) { way.forEach(clampDisk); buildRoute(way); }
+      else if (st.plan !== null && st.plan !== undefined && PLANS[+st.plan]) S.plan = PLANS[+st.plan];
+      applySite(S.base, st.base || {});
+      S.relayAnt = antId(st.relayAnt, "iso");
+      var rel = Array.isArray(st.relays) ? st.relays : [];
+      cut = rel.length > MAX_RELAYS;
+      S.nodes = [];
+      rel.slice(0, MAX_RELAYS).forEach(function (o) {
+        if (!o || !isFinite(+o.x) || !isFinite(+o.y)) return;
+        var q = relay("R" + (S.nodes.length + 1), +o.x, +o.y, 1.5); q.ant = S.relayAnt; applySite(q, o); clampDisk(q); S.nodes.push(q);
+      });
+      S.seq = S.nodes.length + 1;
+      S.rxMode = st.rx === "omni" ? "omni" : "best";
+      var p = PRESETS.filter(function (q) { return q.id === st.preset; })[0] || PRESETS.filter(function (q) { return q.id === "sf9"; })[0];
+      S.preset = p.id; S.fMHz = p.f || num(st.f, 50, 3500, 433);
+      S.rateTarget = [1758, 10000, 100000, 1000000].indexOf(+st.rate) >= 0 ? +st.rate : 1758;
+      S.fade = +st.fade === 22.5 ? 22.5 : FADE_STUDY;
+      S.crew.h = num(st.crew, 0.5, 5, HR_DEFAULT);
+      S.overlay = ["coverage", "slope", "winter", "none"].indexOf(st.ov) >= 0 ? st.ov : "coverage";
+      $("t-psr").checked = !!st.psr; $("t-route").checked = st.route !== false; S.showPat = st.pat !== false;
+      syncControls();
+    } finally { applying = false; }
+    fitPlan(); markStale(); renderAll(); renderAnt("Relays", S.relayAnt);
+    if (cut) hintShow("Only the first " + MAX_RELAYS + " relays were loaded.", 3500);
+    if (run) return simulate();
+  }
+  function trackTimes(P) {
+    var dt = P.dt.map(function (v) { return v * 60; }), t = [0], tot = 0, i;
+    for (i = 0; i < dt.length; i++) tot += dt[i];
+    for (i = 1; i < dt.length; i++) t.push(t[i - 1] + (dt[i - 1] + dt[i]) / 2);
+    var k = t[t.length - 1] > 0 ? tot / t[t.length - 1] : 1;
+    return t.map(function (v) { return r1(v * k); });
+  }
+  function scenario() {
+    var P = S.plan, nodes = [], t = P ? trackTimes(P) : null, slug = function (s) { return s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, ""); };
+    var site = function (name, q) { var o = { name: name, x: r1(q.x), y: r1(q.y), h: q.h, ant: q.ant, bore: Math.round(q.bore || 0), start_s: 0 }; return o; };
+    nodes.push(site("base", S.base));
+    S.nodes.forEach(function (q) {
+      var o = site(q.id, q);
+      if (P && P.deployment !== "static") {
+        var bk = -1, bd = 60;
+        for (var k = 0; k < P.tx.length; k++) { var d = Math.hypot(P.tx[k] - q.x, P.ty[k] - q.y); if (d < bd) { bd = d; bk = k; } }
+        if (bk >= 0) o.start_s = t[bk];
+      }
+      nodes.push(o);
+    });
+    if (P) nodes.push({ name: "crew", h: S.crew.h, ant: "iso", start_s: 0, track: { t: t, x: P.tx.map(r1), y: P.ty.map(r1) } });
+    return {
+      name: slug((P ? P.name : "placement") + " " + S.preset), preset: S.preset, step_s: 10, omni_listen: S.rxMode === "omni", nodes: nodes,
+      note: "Malapert Node Planner export. Build a mesh-simulator link table with terrain-sims: python -B -m models.linktable <this file> -o <table>. Map coordinates in meters, y north; bearings clockwise from north. " +
+        (LORA_IDS.indexOf(S.preset) < 0 ? "The link table supports LoRa presets only; this plan uses " + S.preset + ". " : "") +
+        "Relays within 60 m of the route switch on when the crew reaches them" + (P && P.deployment === "static" ? " (not for this plan: its relays are placed beforehand)" : "") + ".",
+      exported: new Date().toISOString(), planner: planState()
+    };
+  }
+  function fromScenario(o) {
+    var nd = o.nodes, b = nd[0] || {}, rel = [], way = null, crew = HR_DEFAULT;
+    nd.slice(1).forEach(function (q) {
+      if (q && q.track && Array.isArray(q.track.x)) {
+        if (!way) { var n = q.track.x.length, step = Math.max(1, Math.ceil(n / 200)); way = []; for (var i = 0; i < n; i += step) way.push([q.track.x[i], q.track.y[i]]); way.push([q.track.x[n - 1], q.track.y[n - 1]]); crew = q.h || crew; }
+      } else if (q) rel.push({ x: q.x, y: q.y, h: q.h, ant: q.ant, bore: q.bore });
+    });
+    return { v: 1, plan: null, way: way, base: { h: b.h, ant: b.ant, bore: b.bore }, relays: rel, relayAnt: "iso", rx: o.omni_listen ? "omni" : "best", preset: o.preset || "sf9", fade: FADE_STUDY, crew: crew };
+  }
+  function importText(text) {
+    var o = JSON.parse(text);
+    var st = o && o.v === 1 ? o : o && o.planner && o.planner.v === 1 ? o.planner : o && Array.isArray(o.nodes) ? fromScenario(o) : null;
+    if (!st) throw new Error("the file has no planner state and no scenario nodes");
+    return applyState(st, true);
+  }
+  function jsonText(o) {
+    return JSON.stringify(o, null, 1).replace(/\[\s+([-\d.,\s]+?)\s+\]/g, function (m, inner) { return "[" + inner.replace(/\s+/g, "") + "]"; }) + "\n";
+  }
+  function exportJSON() {
+    var sc = scenario(), a = document.createElement("a"), url = URL.createObjectURL(new Blob([jsonText(sc)], { type: "application/json" }));
+    a.href = url; a.download = "malapert-" + sc.name + ".json"; document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 0);
+    hintShow("Exported " + a.download, 2500);
+  }
+  function copyLink() {
+    persist(true);
+    var url = location.href, done = function () { hintShow(location.protocol === "file:" ? "Link copied. A file link opens only on this computer; to share, use Export." : "Link copied.", 3000); };
+    var fallback = function () { window.prompt("Copy this link:", url); };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(url).then(done, fallback); else fallback();
+  }
+  (function () {
+    $("copylink").addEventListener("click", copyLink);
+    $("export").addEventListener("click", exportJSON);
+    $("import").addEventListener("click", function () { $("importf").value = ""; $("importf").click(); });
+    $("importf").addEventListener("change", function () {
+      var f = $("importf").files[0]; if (!f) return;
+      f.text().then(importText).then(function () { hintShow("Loaded " + f.name, 2500); }).catch(function (e) { hintShow("Could not load " + f.name + ": " + e.message, 5000); });
+    });
+    $("reset").addEventListener("click", function () {
+      clearTimeout(persistT); applying = true;
+      try { localStorage.removeItem(STORE_KEY); } catch (e) { }
+      location.replace(location.pathname + location.search);
+    });
+    window.addEventListener("keydown", function (e) {
+      if (e.key !== "Escape") return;
+      if (S.probing) setProbing(false); else if (S.prof && !S.placing && !S.drawing && !S.picking) closeProfile();
+    });
+    window.addEventListener("resize", function () { if (S.profData && !$("prof").hidden) { $("wrap").style.setProperty("--prof-h", $("prof").offsetHeight + "px"); drawProfile(); } });
+    window.addEventListener("hashchange", function () { var st = fromHash(); if (st && !st.bad) { try { applyState(st, true); } catch (e) { hintShow("The plan in this link could not be read.", 4000); } } });
+  })();
+
   // ---- controls
   function presetList() {
     var add = function (g, v, t) { var o = document.createElement("option"); o.value = v; o.textContent = t; g.appendChild(o); };
@@ -801,7 +1331,7 @@
   function loadPlan(i, run) {
     if (S.drawing) setDrawing(false);
     var P = i === "" ? null : PLANS[+i]; S.plan = P; S.auto = null; S.target = null; S.solo = null; S.sel = null;
-    S.nodes = P ? P.nodes.map(function (q, k) { return { id: "R" + (k + 1), x: q[0], y: q[1], h: 1.5 }; }) : [];
+    S.nodes = P ? P.nodes.map(function (q, k) { return relay("R" + (k + 1), q[0], q[1], 1.5); }) : [];
     S.seq = S.nodes.length + 1;
     if (P) { S.fade = P.budget === "128.5" ? 22.5 : 10; $("budget").value = String(S.fade); }
     fitPlan(); markStale(); renderValid(); renderPlan(); renderNodes(); renderLegend();
@@ -818,9 +1348,14 @@
     draw();
   }
   $("simulate").addEventListener("click", simulate);
-  document.querySelectorAll("input[name=ov]").forEach(function (e) { e.addEventListener("change", function () { S.overlay = e.value; renderLegend(); draw(); }); });
-  $("t-psr").addEventListener("change", function () { renderLegend(); draw(); });
-  $("t-route").addEventListener("change", function () { renderLegend(); draw(); });
+  $("ant-rx").addEventListener("change", function () { S.rxMode = $("ant-rx").value; markStale(); });
+  $("ant-base").addEventListener("change", function () { S.base.ant = $("ant-base").value; markStale(); renderNodes(); renderLegend(); renderAnt("Base", S.base.ant); });
+  $("ant-relay").addEventListener("change", function () { S.relayAnt = $("ant-relay").value; S.nodes.forEach(function (q) { q.ant = S.relayAnt; }); markStale(); renderNodes(); renderLegend(); renderAnt("Relays", S.relayAnt); });
+  $("aim").addEventListener("click", function () { if (S.busy) { hintShow("A run is still going. Try again when it finishes.", 2500); return; } aimAll(true); });
+  $("t-pat").addEventListener("change", function () { S.showPat = $("t-pat").checked; renderLegend(); draw(); persist(); });
+  document.querySelectorAll("input[name=ov]").forEach(function (e) { e.addEventListener("change", function () { S.overlay = e.value; renderLegend(); draw(); persist(); }); });
+  $("t-psr").addEventListener("change", function () { renderLegend(); draw(); persist(); });
+  $("t-route").addEventListener("change", function () { renderLegend(); draw(); persist(); });
   $("preset").addEventListener("change", function () {
     S.preset = $("preset").value;
     var p = PRESETS.filter(function (q) { return q.id === S.preset; })[0];
@@ -828,7 +1363,7 @@
     renderValid(); markStale();
   });
   $("freq").addEventListener("input", function () { S.fMHz = sliderToF(+$("freq").value); S.preset = "free"; $("preset").value = "free"; renderValid(); markStale(); });
-  $("target").addEventListener("change", function () { S.target = +$("target").value; renderValid(); markStale(); });
+  $("rate-target").addEventListener("change", function () { S.rateTarget = +$("rate-target").value; renderValid(); markStale(); });
   $("budget").addEventListener("change", function () { S.fade = +$("budget").value; renderValid(); markStale(); });
   $("crewh").addEventListener("change", function () { var v = parseFloat($("crewh").value); if (v >= 0.5 && v <= 5) { S.crew.h = v; markStale(); } else $("crewh").value = S.crew.h; });
   $("add").addEventListener("click", function () { setPlacing(!S.placing); });
@@ -846,15 +1381,24 @@
 
   // ---- start
   presetList(); renderValid(); renderLegend();
+  antOptions($("ant-base")); antOptions($("ant-relay"));
+  $("ant-base").value = S.base.ant; $("ant-relay").value = S.relayAnt; renderAnt();
   $("freq").value = fToSlider(433);
   resize();
   var firstPlan = PLANS.findIndex(function (p) { return p.case === "c2" && p.budget === "141"; });
   var pv = new Image(); pv.onload = function () { if (!overview) { overview = pv; draw(); } }; pv.src = META.preview;
-  loadPlan(String(firstPlan), false);
+  var saved = fromHash(), restored = false;
+  if (saved && saved.bad) { saved = null; hintShow("The plan in this link could not be read, so the default plan is shown.", 5000); }
+  else if (!saved) saved = fromStore();
+  if (saved) { try { applyState(saved, false); restored = true; } catch (e) { hintShow("The saved plan could not be loaded: " + e.message, 5000); } }
+  if (!restored) loadPlan(String(firstPlan), false);
   var ovw = new Image(); ovw.onload = function () { overview = ovw; draw(); }; ovw.src = "data/hill_overview.webp";
   loadData().then(function () {
     renderNodes(); draw();
-    window.malapert = { S: S, simulate: simulate, autoPlan: autoPlan, buildRoute: buildRoute, loadPlan: loadPlan, view: view };
+    var tiltAt = function (x, y) { var d = 20, gx = (ter.sample(x + d, y) - ter.sample(x - d, y)) / (2 * d), gy = (ter.sample(x, y + d) - ter.sample(x, y - d)) / (2 * d), b = Math.atan2(-gx, -gy) * 180 / Math.PI; return { t: Math.atan(Math.hypot(gx, gy)) * 180 / Math.PI, ta: b < 0 ? b + 360 : b }; };
+    window.malapert = { tiltAt: tiltAt, S: S, simulate: simulate, autoPlan: autoPlan, buildRoute: buildRoute, loadPlan: loadPlan, view: view, aimAll: aimAll, ANTS: ANTS, renderAll: renderAll, renderAnt: renderAnt,
+      openProfile: openProfile, closeProfile: closeProfile, profile: function () { return S.profData; }, hitLink: hitLink, toScreen: function (x, y) { return { x: sx(x), y: sy(y) }; },
+      planState: planState, scenario: scenario, applyState: applyState, importText: importText, enc: enc, dec: dec };
     return simulate();
   }).catch(function (e) {
     setChip("Not loaded", "stale"); $("stat").textContent = "";
