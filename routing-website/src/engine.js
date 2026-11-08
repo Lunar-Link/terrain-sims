@@ -3,7 +3,7 @@
 var LL = (function () {
   var C0 = 299792458.0, R_MOON = 1737400.0, EPS_REG = 2.5, TAND_REG = 0.004, EPS0 = 8.8541878128e-12;
   var FINAL = { lmin: 30.0, gap: 200.0, q: 0.5, rmax: 20000.0 };
-  var LOG10 = Math.log(10), PI = Math.PI;
+  var LOG10 = Math.log(10), PI = Math.PI, DEG = 180 / Math.PI;
 
   function log10(x) { return Math.log(x) / LOG10; }
   function sigma(f) { return 2 * PI * f * EPS0 * EPS_REG * TAND_REG; }
@@ -179,6 +179,9 @@ var LL = (function () {
   function hybridProfile(z, N, D, ht, hr, p, off) {
     var o = FINAL, c = p526(z, N, D, ht, hr, p), lam = p.lam;
     var res = { L: c.L, L526: c.L, fspl: c.fspl, los: c.los, theta: c.los ? 0 : c.Stim + c.Srim, T: 0, A_tx: 0, A_rx: 0, nrun: 0, A_obs: c.Luc };
+    var cvv = D / (2 * R_MOON), s0 = (c.hrs - c.hts) / D;
+    res.elT = Math.atan(c.los ? s0 - cvv : c.Stim - cvv) * DEG; res.elR = Math.atan(c.los ? -s0 - cvv : c.Srim - cvv) * DEG;
+    res.Ld = c.Ld; res.hts = c.hts; res.hrs = c.hrs; res.itim = c.itim; res.irim = c.irim; res.Stim = c.Stim; res.Srim = c.Srim; res.db = c.db; res.runs = [];
     if (off || c.los) return res;
     ensure(N);
     var st = D / (N - 1), ze = buf.ze, yy = buf.yy, hs = buf.hs, hts = c.hts, hrs = c.hrs, i;
@@ -226,7 +229,7 @@ var LL = (function () {
       sides[sd] = th > 0 ? gammaWeighted(p, psi, phi, sinc, r * wgt) : 0;
     }
     var L = Math.max(c.L, c.fspl + Aobs + sides[0] + sides[1]);
-    res.L = L; res.T = T; res.A_tx = sides[0]; res.A_rx = sides[1]; res.nrun = runs.length; res.A_obs = Aobs;
+    res.L = L; res.T = T; res.A_tx = sides[0]; res.A_rx = sides[1]; res.nrun = runs.length; res.A_obs = Aobs; res.runs = runs;
     return res;
   }
   function makeRun(i0, i1, th, st, ze, N, o) {
@@ -236,7 +239,7 @@ var LL = (function () {
       var Rf = parabolaRadius(ze, st, Math.max(ic - nw, 0), Math.min(ic + nw, N - 1));
       if (Rf < R) R = Rf;
     }
-    return { th: th, R: R, dc: 0.5 * (i0 + i1) * st };
+    return { th: th, R: R, dc: 0.5 * (i0 + i1) * st, i0: i0, i1: i1 };
   }
 
   // ---- terrain
@@ -258,7 +261,7 @@ var LL = (function () {
   };
   function linkLoss(ter, sx, sy, tx, ty, ht, hr, p, off) {
     var dm = Math.hypot(tx - sx, ty - sy);
-    if (dm < 1) return { L: 0, L526: 0, los: true, D: dm, theta: 0 };
+    if (dm < 1) return { L: 0, L526: 0, los: true, D: dm, theta: 0, elT: 0, elR: 0 };
     var q = ter.profile(sx, sy, tx, ty, ter.cell), r = hybridProfile(q.z, q.N, q.D, ht, hr, p, off);
     r.D = q.D;
     return r;
@@ -306,7 +309,7 @@ var LL = (function () {
     var c2 = v / (n * S4 - S2 * S2) / (st * st);
     return c2 < 0 ? -1 / (2 * c2) : Infinity;
   };
-  Sweep.prototype.run = function (ter, sx, sy, sinA, cosA, ht, hr, ds, n, p, lossCut, out) {
+  Sweep.prototype.run = function (ter, sx, sy, sinA, cosA, ht, hr, ds, n, p, lossCut, out, gt, gr) {
     if (n + 2 > this.cap) this.grow(Math.ceil(n * 1.5) + 2);
     var ae = R_MOON, i2ae = 1 / (2 * ae), lam = p.lam, o = FINAL, gap = o.gap, lmin = o.lmin, rmax = o.rmax;
     var z = this.z, y = this.y, A = this.A, B = this.B, p0 = this.p0, p1 = this.p1, p2 = this.p2, amax = this.amax;
@@ -464,8 +467,12 @@ var LL = (function () {
         var Lbs = smoothBull(k, st, D, htse, hrse, lam);
         if (Lsph > Lbs) Ld = Lba + Lsph - Lbs;
       }
-      var L526 = fspl + Ld;
-      out[k] = !los && Lhyb > L526 ? Lhyb : L526;
+      var L526 = fspl + Ld, Lk = !los && Lhyb > L526 ? Lhyb : L526;
+      if (gt) {
+        var cvv = D * i2ae, s0 = (hrs - hts) / D;
+        Lk -= elGain(gt, Math.atan(los ? s0 - cvv : Stim - cvv) * DEG) + elGain(gr, Math.atan(los ? -s0 - cvv : Srim - cvv) * DEG);
+      }
+      out[k] = Lk;
     }
     if (n >= 2) out[1] = out[2];
     out[0] = 0;
@@ -501,6 +508,54 @@ var LL = (function () {
     return corrected(Luc, D);
   }
 
+  // ---- antennas: free-space pattern tables, az clockwise from boresight by azStep, el from the horizon by elStep from elMin; switched types take the best of their beam states
+  var AG = { elMin: -90, elStep: 2 };
+  function Antenna(s) {
+    this.id = s.id; this.g = s.g; this.naz = s.naz; this.nel = s.nel; this.azStep = s.azStep; this.elStep = s.elStep; this.elMin = s.elMin; this.beams = s.beams || 1; this.iso = !!s.iso;
+    AG.elMin = s.elMin; AG.elStep = s.elStep;
+  }
+  Antenna.prototype.raw = function (az, el) {
+    var fa = (((az % 360) + 360) % 360) / this.azStep, fe = (el - this.elMin) / this.elStep, naz = this.naz;
+    var a0 = Math.floor(fa), ta = fa - a0, e0 = Math.floor(fe), te = fe - e0;
+    if (e0 < 0) { e0 = 0; te = 0; } else if (e0 >= this.nel - 1) { e0 = this.nel - 2; te = 1; }
+    a0 %= naz; var a1 = (a0 + 1) % naz, g = this.g, r0 = e0 * naz, r1 = r0 + naz;
+    return (1 - te) * ((1 - ta) * g[r0 + a0] + ta * g[r0 + a1]) + te * ((1 - ta) * g[r1 + a0] + ta * g[r1 + a1]);
+  };
+  Antenna.prototype.gain = function (az, el) {
+    if (this.iso) return 0;
+    if (this.beams === 1) return this.raw(az, el);
+    var b = -Infinity, st = 360 / this.beams;
+    for (var k = 0; k < this.beams; k++) { var v = this.raw(az - k * st, el); if (v > b) b = v; }
+    return b;
+  };
+  Antenna.prototype.row = function (az, tl) {
+    var r = new Float64Array(this.nel);
+    for (var e = 0; e < this.nel; e++) { var el = this.elMin + e * this.elStep; r[e] = tl ? this.gainTilted(az, el, tl) : this.gain(az, el); }
+    return r;
+  };
+  // A mast leaning t degrees toward bearing ta: world bearing and elevation into the antenna's own frame. tl = { t, ta, bore }; az is world bearing minus bore.
+  function tiltFrame(t, ta) {
+    var tr = t / DEG, ar = ta / DEG, h = [Math.sin(ar), Math.cos(ar), 0], z = [Math.sin(tr) * h[0], Math.sin(tr) * h[1], Math.cos(tr)];
+    var y = [-z[1] * z[0], 1 - z[1] * z[1], -z[1] * z[2]], n = Math.hypot(y[0], y[1], y[2]);
+    y = [y[0] / n, y[1] / n, y[2] / n];
+    var x = [y[1] * z[2] - y[2] * z[1], y[2] * z[0] - y[0] * z[2], y[0] * z[1] - y[1] * z[0]];
+    return { x: x, y: y, z: z };
+  }
+  Antenna.prototype.gainTilted = function (az, el, tl) {
+    if (this.iso) return 0;
+    var f = tl.f || (tl.f = tiltFrame(tl.t, tl.ta)), b = (az + tl.bore) / DEG, e = el / DEG, ce = Math.cos(e);
+    var d = [Math.sin(b) * ce, Math.cos(b) * ce, Math.sin(e)];
+    var dz = d[0] * f.z[0] + d[1] * f.z[1] + d[2] * f.z[2], dx = d[0] * f.x[0] + d[1] * f.x[1] + d[2] * f.x[2], dy = d[0] * f.y[0] + d[1] * f.y[1] + d[2] * f.y[2];
+    return this.gain(Math.atan2(dx, dy) * DEG - tl.bore, Math.asin(Math.max(-1, Math.min(1, dz))) * DEG);
+  };
+  function elGain(row, el) {
+    var f = (el - AG.elMin) / AG.elStep, i = Math.floor(f), t = f - i, n = row.length;
+    if (i < 0) return row[0];
+    if (i >= n - 1) return row[n - 1];
+    return row[i] + t * (row[i + 1] - row[i]);
+  }
+  function bearing(sx, sy, tx, ty) { var a = Math.atan2(tx - sx, ty - sy) * DEG; return a < 0 ? a + 360 : a; }
+
   // Number of samples along a radial before it leaves the disk.
   function radialEnd(ter, sx, sy, sinA, cosA, ds) {
     var ox = sx - ter.bx, oy = sy - ter.by, b = ox * sinA + oy * cosA, c = ox * ox + oy * oy - ter.rdisk * ter.rdisk;
@@ -510,12 +565,15 @@ var LL = (function () {
   }
 
   // One block of radials for a node; returns per-radial sample counts and losses.
-  function coverageBlock(ter, sw, job, p) {
+  function coverageBlock(ter, sw, job, p, ants) {
     var nAz = job.nAz, ds = job.ds, a0 = job.a0, a1 = job.a1, maxN = job.maxN, sx = job.x, sy = job.y;
     var out = new Float32Array((a1 - a0) * (maxN + 1)), line = new Float64Array(maxN + 1), counts = new Int32Array(a1 - a0);
+    var at = ants && job.ant ? ants[job.ant] : null, ar = ants && job.crew ? ants[job.crew] : null, use = (at && !at.iso) || (ar && !ar.iso);
+    var gr = use ? (ar ? ar.row(0) : new Float64Array(at.nel)) : null;
     for (var a = a0; a < a1; a++) {
       var az = 2 * PI * a / nAz, sn = Math.sin(az), cs = Math.cos(az), n = Math.min(radialEnd(ter, sx, sy, sn, cs, ds), maxN);
-      sw.run(ter, sx, sy, sn, cs, job.ht, job.hr, ds, n, p, job.lossCut, line);
+      var gt = use ? (at ? at.row(az * DEG - (job.bore || 0), job.tilt ? { t: job.tilt, ta: job.tiltAz || 0, bore: job.bore || 0 } : null) : new Float64Array(gr.length)) : null;
+      sw.run(ter, sx, sy, sn, cs, job.ht, job.hr, ds, n, p, job.lossCut, line, gt, gr);
       counts[a - a0] = n;
       var base = (a - a0) * (maxN + 1);
       for (var i = 0; i <= n; i++) out[base + i] = line[i];
@@ -621,12 +679,13 @@ var LL = (function () {
     if (m.type === "init") {
       var t = m.terrain;
       state.ter = new Terrain(m.dem, t.nr, t.nc, t.x0, t.ytop, t.cell, t.bx, t.by, t.rdisk);
-      state.sw = new Sweep(2048); state.params = {};
+      state.sw = new Sweep(2048); state.params = {}; state.ants = {};
+      if (m.ants) for (var id in m.ants) state.ants[id] = new Antenna(m.ants[id]);
       return { type: "ready" };
     }
     var f = m.f, p = state.params[f] || (state.params[f] = new Params(f));
     if (m.type === "cov") {
-      var r = coverageBlock(state.ter, state.sw, m, p);
+      var r = coverageBlock(state.ter, state.sw, m, p, state.ants);
       return { type: "cov", id: m.id, a0: m.a0, a1: m.a1, out: r.out, counts: r.counts, transfer: [r.out.buffer, r.counts.buffer] };
     }
     if (m.type === "raster") {
@@ -635,12 +694,12 @@ var LL = (function () {
       return { type: "raster", id: m.id, into: into, transfer: [into.buffer] };
     }
     if (m.type === "links") {
-      var n = m.links.length / 6, L = new Float64Array(n * 2);
+      var n = m.links.length / 6, L = new Float64Array(n * 2), E = new Float32Array(n * 2);
       for (var i = 0; i < n; i++) {
         var o = i * 6, q = linkLoss(state.ter, m.links[o], m.links[o + 1], m.links[o + 2], m.links[o + 3], m.links[o + 4], m.links[o + 5], p, false);
-        L[i * 2] = q.L; L[i * 2 + 1] = q.los ? 1 : 0;
+        L[i * 2] = q.L; L[i * 2 + 1] = q.los ? 1 : 0; E[i * 2] = q.elT; E[i * 2 + 1] = q.elR;
       }
-      return { type: "links", id: m.id, L: L, transfer: [L.buffer] };
+      return { type: "links", id: m.id, L: L, E: E, transfer: [L.buffer, E.buffer] };
     }
     throw new Error("unknown job " + m.type);
   }
@@ -648,7 +707,8 @@ var LL = (function () {
   return {
     handle: handle, C0: C0, R_MOON: R_MOON, FINAL: FINAL, J: J, sigma: sigma, mapScale: mapScale, Params: Params, p526: p526, hybridProfile: hybridProfile,
     Terrain: Terrain, linkLoss: linkLoss, Sweep: Sweep, radialEnd: radialEnd, coverageBlock: coverageBlock, rasterize: rasterize, widestChain: widestChain,
-    tSys: tSys, shannonRate: shannonRate, lossForRate: lossForRate, hopShare: hopShare, nrRate: nrRate, K_DBM: K_DBM
+    tSys: tSys, shannonRate: shannonRate, lossForRate: lossForRate, hopShare: hopShare, nrRate: nrRate, K_DBM: K_DBM,
+    Antenna: Antenna, elGain: elGain, bearing: bearing
   };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = LL;

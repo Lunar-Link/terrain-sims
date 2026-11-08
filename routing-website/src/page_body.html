@@ -1,4 +1,4 @@
-<!-- Page markup: console rail and map, assembled into index.html by build_page.py. -->
+<!-- Page markup: console rail and map, assembled into index.html by build.py. -->
 <div class="app" id="app">
   <aside class="rail" aria-label="Controls and results">
     <div class="mast">
@@ -40,6 +40,17 @@
           </div>
         </div>
       </section>
+      <section aria-label="Save and share">
+        <h2>Save and share</h2>
+        <div class="btns">
+          <button id="copylink" class="btn" type="button">Copy link</button>
+          <button id="export" class="btn" type="button">Export JSON</button>
+          <button id="import" class="btn" type="button">Import JSON</button>
+          <button id="reset" class="btn" type="button">Start over</button>
+          <input id="importf" type="file" accept=".json,application/json" hidden>
+        </div>
+        <div class="st">The plan is kept in this browser and in the page link, so the link opens the same plan. Export writes a JSON file that the mesh simulator's link-table builder reads: <code>python -B -m models.linktable plan.json -o plan.txt</code> in terrain-sims.</div>
+      </section>
       <section aria-label="Radio">
         <h2>Radio</h2>
         <label class="f">Preset
@@ -48,8 +59,8 @@
         <label class="f" for="freq">Free frequency</label>
         <input id="freq" type="range" min="0" max="1000" step="1" aria-label="Frequency, 50 MHz to 3.5 GHz">
         <div class="rowf"><span>50 MHz</span><span id="freq-v">433 MHz</span><span>3.5 GHz</span></div>
-        <label class="f" id="target-wrap" hidden>Rate to hold on the slider
-          <select id="target">
+        <label class="f" id="rate-target-wrap" hidden>Rate to hold on the slider
+          <select id="rate-target">
             <option value="1758">1.76 kb/s, the SF9 rate</option>
             <option value="10000">10 kb/s</option>
             <option value="100000">100 kb/s</option>
@@ -67,12 +78,36 @@
           <input id="crewh" type="number" min="0.5" max="5" step="0.1" value="1.5">
         </label>
       </section>
+      <section aria-label="Antennas">
+        <h2>Antennas</h2>
+        <label class="f">Base antenna
+          <select id="ant-base"></select>
+        </label>
+        <label class="f">Relay antenna, sets every relay
+          <select id="ant-relay"></select>
+        </label>
+        <label class="f">Switched and phased arrays listen
+          <select id="ant-rx">
+            <option value="best">On the best beam (ideal)</option>
+            <option value="omni">On the omni setting, beam only to send</option>
+          </select>
+        </label>
+        <div class="btns antbtns">
+          <button id="aim" class="btn" type="button">Aim along the chain</button>
+          <label class="ov1"><input type="checkbox" id="t-pat" checked>Show shapes on map</label>
+        </div>
+        <canvas id="antprev" width="340" height="170" aria-label="Horizon and vertical pattern of the chosen antenna against a half-wave dipole"></canvas>
+        <div id="ant-note" class="st"></div>
+        <div class="st antcav">Free-space patterns of lossless 433 MHz designs, added at the node end of every link at the ray's take-off angle, and at both ends between nodes; the crew or target end stays 0 dBi. The terrain model already includes the ground. Switched and phased arrays use their best beam for each link. Isotropic is the study's assumption and the default.</div>
+      </section>
       <section aria-label="Sites">
         <h2>Sites</h2>
         <div id="nodes" class="nodes"></div>
       </section>
       <section aria-label="Links">
         <h2>Links</h2>
+        <div class="btns"><button id="probe" class="btn" type="button" aria-pressed="false">Profile to a point</button></div>
+        <div class="st">Click a link on the map, or press Profile in the table, to see the terrain between its ends. Profile to a point starts at the selected site and ends at crew height.</div>
         <div class="tbl" id="links"></div>
       </section>
       <section aria-label="Map layers">
@@ -96,5 +131,15 @@
     <div class="read" id="read" hidden></div>
     <div class="maptop"><button id="zin" type="button" aria-label="Zoom in">+</button><button id="zout" type="button" aria-label="Zoom out">−</button></div>
     <div class="hint" id="hint" hidden></div>
+    <div class="prof" id="prof" role="region" aria-label="Link profile" hidden>
+      <div class="prof-h">
+        <b id="prof-t"></b><span id="prof-m"></span><span id="prof-s"></span>
+        <div class="prof-btns"><button id="prof-swap" type="button">Swap ends</button><button id="prof-x" type="button" aria-label="Close the profile">×</button></div>
+      </div>
+      <div class="prof-b">
+        <div class="prof-plot"><canvas id="prof-cv" role="img" aria-label="Terrain height along the link with the direct ray, the first Fresnel zone and the obstacles"></canvas><div class="prof-read" id="prof-read" hidden></div></div>
+        <div class="prof-k" id="prof-k"></div>
+      </div>
+    </div>
   </div>
 </div>
