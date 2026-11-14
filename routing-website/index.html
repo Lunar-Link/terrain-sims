@@ -197,6 +197,9 @@ details ul { padding-left: 16px; }
             <label class="f">Extra margin, dB
               <input id="auto-x" type="number" min="0" max="20" step="1" value="0">
             </label>
+            <label class="f">Max relay failures
+              <input id="auto-failures" type="number" min="0" max="12" step="1" value="0">
+            </label>
           </div>
         </div>
       </section>
@@ -1352,6 +1355,125 @@ window.MALAPERT_ANT={"f_mhz":433,"az_step":2,"el_step":2,"el_min":-90,"antennas"
     }
     return null;
   }
+  // Minimum relay-cost set of internally node-disjoint paths in a candidate-link graph.
+  function disjointPaths(n, edges, count) {
+    var source = 0, sink = 1, size = 2 + 2 * Math.max(0, n - 2), graph = Array.from({ length: size }, function () { return []; });
+    function inside(i) { return 2 + 2 * (i - 1); }
+    function outside(i) { return inside(i) + 1; }
+    function add(u, v, cap, cost, site) {
+      var f = { to: v, rev: graph[v].length, cap: cap, initial: cap, cost: cost, site: site }, b = { to: u, rev: graph[u].length, cap: 0, initial: 0, cost: -cost };
+      graph[u].push(f); graph[v].push(b);
+    }
+    function push(heap, item) {
+      var i = heap.length; heap.push(item);
+      while (i) { var p = (i - 1) >> 1; if (heap[p][0] <= item[0]) break; heap[i] = heap[p]; i = p; }
+      heap[i] = item;
+    }
+    function pop(heap) {
+      var top = heap[0], last = heap.pop();
+      if (heap.length) {
+        var i = 0;
+        while (true) { var l = 2 * i + 1, r = l + 1; if (l >= heap.length) break; var c = r < heap.length && heap[r][0] < heap[l][0] ? r : l; if (heap[c][0] >= last[0]) break; heap[i] = heap[c]; i = c; }
+        heap[i] = last;
+      }
+      return top;
+    }
+    for (var i = 1; i < n - 1; i++) add(inside(i), outside(i), 1, 1, i);
+    edges.forEach(function (e) {
+      var u = e[0], v = e[1];
+      if (u === 0 && v === n - 1) return;
+      if (u === 0) add(source, inside(v), count, 0);
+      else if (v === n - 1) add(outside(u), sink, count, 0);
+      else { add(outside(u), inside(v), count, 0); add(outside(v), inside(u), count, 0); }
+    });
+    var potential = new Float64Array(size), flow = 0, cost = 0;
+    while (flow < count) {
+      var dist = new Float64Array(size).fill(Infinity), prevN = new Int32Array(size).fill(-1), prevE = new Int32Array(size).fill(-1), heap = [];
+      dist[source] = 0; push(heap, [0, source]);
+      while (heap.length) {
+        var item = pop(heap), du = item[0], u0 = item[1];
+        if (du !== dist[u0]) continue;
+        for (var ei = 0; ei < graph[u0].length; ei++) {
+          var ed = graph[u0][ei]; if (!ed.cap) continue;
+          var nd = du + ed.cost + potential[u0] - potential[ed.to];
+          if (nd + 1e-12 >= dist[ed.to]) continue;
+          dist[ed.to] = nd; prevN[ed.to] = u0; prevE[ed.to] = ei; push(heap, [nd, ed.to]);
+        }
+      }
+      if (!isFinite(dist[sink])) break;
+      for (i = 0; i < size; i++) if (isFinite(dist[i])) potential[i] += dist[i];
+      var addFlow = count;
+      for (var v0 = sink; v0 !== source; v0 = prevN[v0]) addFlow = Math.min(addFlow, graph[prevN[v0]][prevE[v0]].cap);
+      for (v0 = sink; v0 !== source; v0 = prevN[v0]) {
+        var pe = graph[prevN[v0]][prevE[v0]]; pe.cap -= addFlow; graph[v0][pe.rev].cap += addFlow; cost += addFlow * pe.cost;
+      }
+      flow += addFlow;
+    }
+    if (flow < count) return null;
+    graph.forEach(function (row) { row.forEach(function (e) { if (e.initial) e.flow = e.initial - e.cap; }); });
+    var paths = [];
+    function take(u, used, seen) {
+      if (u === sink) return [];
+      seen[u] = 1;
+      for (var k = 0; k < graph[u].length; k++) {
+        var e = graph[u][k]; if (!(e.flow > 0) || seen[e.to]) continue;
+        var tail = take(e.to, used, seen);
+        if (tail) { e.flow--; return (e.site ? [e.site] : []).concat(tail); }
+      }
+      seen[u] = 0; return null;
+    }
+    for (i = 0; i < count; i++) {
+      var middle = take(source, [], new Uint8Array(size));
+      if (!middle) return null;
+      paths.push([0].concat(middle, [n - 1]));
+    }
+    return { cost: cost, paths: paths };
+  }
+  async function robustPointSearch(r, need, h, failures, maxRelays, setStat) {
+    var gB = covG(S.base.ant), gR = covG(S.relayAnt), tg = { x: S.target.x, y: S.target.y, h: S.crew.h, g: function () { return 0; } }, D = Math.hypot(tg.x - S.base.x, tg.y - S.base.y);
+    setStat("Checking the direct base-to-target link", 0.05);
+    var direct = await linkBatch(r, Float64Array.from([S.base.x, S.base.y, tg.x, tg.y, S.base.h, tg.h, tg.x, tg.y, S.base.x, S.base.y, tg.h, S.base.h]), function (p, e1, e2) { return p ? gB(e2) : gB(e1); });
+    if (r.ceil - direct[0] >= need && r.ceil - direct[1] >= need) return { mid: [], paths: [[S.base, tg]], target: tg, count: 0, spacing: 0, whole: false, cx: tg.x, cy: tg.y };
+    if (failures + 1 > maxRelays) return null;
+    for (var pass = 0; pass < 2; pass++) {
+      var whole = pass === 1, c = candidates(whole ? null : [S.base, tg], Math.max(1500, 0.35 * D), whole ? 700 : 500);
+      var list = [S.base].concat(c.sites.map(function (q) { return { x: q.x, y: q.y, h: h, g: gR }; }), [tg]), n = list.length, pairs = [], a = [], gains = [gB];
+      c.sites.forEach(function () { gains.push(gR); }); gains.push(function () { return 0; });
+      for (var i = 0; i < n; i++) for (var j = i + 1; j < n; j++) {
+        if (i === 0 && j === n - 1) continue;
+        pairs.push([i, j]);
+        a.push(list[i].x, list[i].y, list[j].x, list[j].y, list[i].h, list[j].h);
+        a.push(list[j].x, list[j].y, list[i].x, list[i].y, list[j].h, list[i].h);
+      }
+      setStat("Checking " + c.sites.length + " sites for " + (failures + 1) + " independent paths" + (whole ? " across the whole map" : ""), 0.15);
+      var L = await linkBatch(r, Float64Array.from(a), function (p, e1, e2) {
+        var edge = pairs[Math.floor(p / 2)], u = p % 2 ? edge[1] : edge[0], v = p % 2 ? edge[0] : edge[1];
+        return gains[u](e1) + gains[v](e2);
+      }), viable = [];
+      for (i = 0; i < pairs.length; i++) {
+        var e = pairs[i], ok = r.ceil - L[2 * i] >= need && r.ceil - L[2 * i + 1] >= need;
+        if (!ok) continue;
+        viable.push([e[0], e[1], Math.min(r.ceil - L[2 * i], r.ceil - L[2 * i + 1])]);
+      }
+      setStat("Selecting the smallest layout with " + (failures + 1) + " independent paths", 0.72);
+      var q = failures + 1 > maxRelays ? null : disjointPaths(n, viable, failures + 1);
+      if (q && q.cost <= maxRelays) {
+        // The primary route has the strongest weakest link; shorter routes break ties.
+        var margins = new Map();
+        viable.forEach(function (e) { margins.set(e[0] * n + e[1], e[2]); });
+        function weakest(path) {
+          var m = Infinity;
+          for (var k = 1; k < path.length; k++) { var u = path[k - 1], v = path[k]; m = Math.min(m, margins.get(Math.min(u, v) * n + Math.max(u, v))); }
+          return m;
+        }
+        q.paths.sort(function (a, b) { return weakest(b) - weakest(a) || a.length - b.length; });
+        var chosen = new Set();
+        q.paths.forEach(function (path) { path.slice(1, -1).forEach(function (id) { chosen.add(id); }); });
+        return { mid: Array.from(chosen).map(function (id) { return list[id]; }), paths: q.paths.map(function (path) { return path.map(function (id) { return list[id]; }); }), target: tg, count: c.sites.length, spacing: c.spacing, whole: whole, cx: tg.x, cy: tg.y };
+      }
+    }
+    return null;
+  }
   function planSite(s) { var r = planRows(s.ant).front; return { x: s.x, y: s.y, h: s.h, g: function (el) { return LL.elGain(r, el); }, c: covG(s.ant) }; }
   async function pointSearch(r, need, h, setStat) {
     var gR = planG(S.relayAnt), tg = { x: S.target.x, y: S.target.y, h: S.crew.h, g: function () { return 0; } }, D = Math.hypot(tg.x - S.base.x, tg.y - S.base.y);
@@ -1466,28 +1588,40 @@ window.MALAPERT_ANT={"f_mhz":433,"az_step":2,"el_step":2,"el_min":-90,"antennas"
     if (!S.busy && !(S.plan && S.plan.drawn) && useTarget !== true) { setPlacing(false); setPicking(!S.picking); return Promise.resolve(); }
     if (S.busy) hintShow("A run is still going. Try again when it finishes.", 2500);
     if (S.busy || !pool) return Promise.resolve();
-    var r = radio(), h = parseFloat($("auto-h").value), extra = parseFloat($("auto-x").value), t0 = performance.now(), drawn = S.plan && S.plan.drawn;
+    var r = radio(), h = parseFloat($("auto-h").value), extra = parseFloat($("auto-x").value), failures = parseInt($("auto-failures").value, 10), t0 = performance.now(), drawn = S.plan && S.plan.drawn;
     h = h >= 0.5 && h <= 30 ? h : 1.5; extra = extra >= 0 && extra <= 20 ? extra : 0;
-    $("auto-h").value = h; $("auto-x").value = extra;
+    failures = !drawn && failures >= 0 && failures <= MAX_RELAYS ? failures : 0;
+    $("auto-h").value = h; $("auto-x").value = extra; $("auto-failures").value = failures;
+    var fixedNodes = failures ? S.nodes.filter(function (v) { return !v.auto; }) : [], maxNew = Math.max(0, MAX_RELAYS - fixedNodes.length);
     var need = r.fade + extra, setStat = function (t, f) { $("stat").textContent = t; $("prog").style.width = Math.min(100, 100 * f) + "%"; };
     S.busy = true; $("simulate").disabled = true; $("auto").disabled = true; setChip("Planning", "stale");
     var done = function () { S.busy = false; $("simulate").disabled = false; $("auto").disabled = false; $("prog").style.width = "0"; };
-    return (drawn ? routeSearch(r, need, h, S.plan, setStat) : pointSearch(r, need, h, setStat)).then(function (q) {
+    return (drawn ? routeSearch(r, need, h, S.plan, setStat) : failures ? robustPointSearch(r, need, h, failures, maxNew, setStat) : pointSearch(r, need, h, setStat)).then(function (q) {
       done();
       var sec = ((performance.now() - t0) / 1000).toFixed(1);
       if (!q) {
         S.auto = null;
         if (S.sim) { renderResult(); setChip(S.stale ? "Out of date" : "Up to date", S.stale ? "stale" : "fresh"); }
-        $("stat").textContent = "No chain of up to " + MAX_RELAYS + " relays reaches the point."; renderPlan(); return null;
+        $("stat").textContent = failures ? "No layout survives up to " + failures + " relay failures with at most " + MAX_RELAYS + " relays." : "No chain of up to " + MAX_RELAYS + " relays reaches the point."; renderPlan(); return null;
       }
       var n = q.mid.length;
       if (!drawn) S.plan = null;
       S.solo = null; S.sel = null;
-      S.nodes = q.mid.map(function (w, k) { return relay("R" + (k + 1), w.x, w.y, h); });
-      S.seq = n + 1;
-      S.auto = drawn ? null : { cx: q.cx, cy: q.cy, from: n ? "R" + n : "B", last: q.last };
+      var relayFor = new Map(), added = [];
+      fixedNodes.forEach(function (v, k) { v.id = "R" + (k + 1); });
+      q.mid.forEach(function (w, k) { var v = relay("R" + (fixedNodes.length + k + 1), w.x, w.y, h); v.auto = !!failures; relayFor.set(w, v); added.push(v); });
+      S.nodes = fixedNodes.concat(added);
+      S.seq = S.nodes.length + 1;
+      var robustOverlay = !drawn && q.paths ? { cx: q.cx, cy: q.cy, paths: q.paths.map(function (p) { return p.map(function (v) { return v === S.base ? S.base : v === q.target ? S.target : relayFor.get(v); }); }) } : null;
+      S.auto = drawn || robustOverlay ? null : { cx: q.cx, cy: q.cy, from: n ? "R" + n : "B", last: q.last };
       fitPlan(); markStale(); renderPlan(); renderNodes(); renderLegend();
-      return aimAll(true);
+      return aimAll(true).then(function (v) {
+        if (robustOverlay) {
+          S.auto = robustOverlay; draw();
+          $("stat").textContent = n ? robustOverlay.paths.length + " independent paths; survives up to " + failures + " relay failures." : "Direct link; survives up to " + failures + " relay failures.";
+        }
+        return v;
+      });
     }).catch(function (e) {
       done(); banner("The relay search failed: " + e.message + ". Reload the page to try again.");
     });
@@ -1617,15 +1751,16 @@ window.MALAPERT_ANT={"f_mhz":433,"az_step":2,"el_step":2,"el_min":-90,"antennas"
   }
   function linkLines() {
     var sim = S.sim; if (!sim) { profLine(); return; }
-    var L = sim.list, n = L.length, i, j, r = sim.r;
+    var L = sim.list, n = L.length, i, j, r = sim.r, point = !!S.target;
     ctx.save(); if (S.stale) { ctx.setLineDash([6, 5]); ctx.globalAlpha = 0.55; }
     for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) {
       var m = sim.hop[i][j]; if (!(m >= 0)) continue;
       var chain = sim.par[i] === j || sim.par[j] === i;
-      if (chain) continue;
+      if (chain && !point) continue;
       ctx.beginPath(); ctx.moveTo(sx(L[i].x), sy(L[i].y)); ctx.lineTo(sx(L[j].x), sy(L[j].y));
-      ctx.lineWidth = 1; ctx.strokeStyle = m >= r.fade ? "rgba(233,236,238,0.45)" : "rgba(255,214,64,0.5)"; ctx.stroke();
+      ctx.lineWidth = 1; ctx.strokeStyle = point ? "rgba(170,178,186,0.6)" : m >= r.fade ? "rgba(233,236,238,0.45)" : "rgba(255,214,64,0.5)"; ctx.stroke();
     }
+    if (point) { ctx.restore(); profLine(); return; }
     for (i = 1; i < n; i++) {
       var p = sim.par[i]; if (p < 0) continue;
       var mm = sim.hop[i][p], ok = mm >= r.fade;
@@ -1661,9 +1796,27 @@ window.MALAPERT_ANT={"f_mhz":433,"az_step":2,"el_step":2,"el_min":-90,"antennas"
   }
   function targetLink() {
     var A = S.auto, sim = S.sim;
-    if (!A || !sim || S.stale || A.from === undefined || !S.target || S.target.x !== A.cx || S.target.y !== A.cy) return;
+    if (!A || !sim || S.stale || !S.target || S.target.x !== A.cx || S.target.y !== A.cy) return;
+    if (A.paths) {
+      ctx.save(); ctx.lineCap = "round"; ctx.lineJoin = "round";
+      // Draw backups first so the primary route remains visible at crossings.
+      A.paths.slice().reverse().forEach(function (path, i, paths) {
+        if (path.length < 2) return;
+        var primary = i === paths.length - 1;
+        ctx.beginPath(); ctx.moveTo(sx(path[0].x), sy(path[0].y));
+        for (var k = 1; k < path.length; k++) ctx.lineTo(sx(path[k].x), sy(path[k].y));
+        if (primary) { ctx.lineWidth = 6; ctx.strokeStyle = "rgba(8,11,14,0.78)"; ctx.stroke(); }
+        ctx.lineWidth = primary ? 3 : 1; ctx.strokeStyle = primary ? "#7fe0c2" : "rgba(170,178,186,0.6)"; ctx.stroke();
+      });
+      ctx.setLineDash([]); ctx.restore(); return;
+    }
+    if (A.from === undefined) return;
     var q = sim.list.filter(function (u) { return u.id === A.from; })[0]; if (!q) return;
-    ctx.beginPath(); ctx.moveTo(sx(q.x), sy(q.y)); ctx.lineTo(sx(S.target.x), sy(S.target.y));
+    var path = [q], at = sim.list.indexOf(q);
+    while (at > 0 && sim.par[at] >= 0) { at = sim.par[at]; path.unshift(sim.list[at]); }
+    path.push(S.target);
+    ctx.beginPath(); ctx.moveTo(sx(path[0].x), sy(path[0].y));
+    for (var k = 1; k < path.length; k++) ctx.lineTo(sx(path[k].x), sy(path[k].y));
     ctx.lineWidth = 5; ctx.strokeStyle = "rgba(8,11,14,0.7)"; ctx.stroke();
     ctx.lineWidth = 2.5; ctx.strokeStyle = "#7fe0c2"; ctx.stroke();
     ctx.font = "12px 'B612', 'Segoe UI', sans-serif"; ctx.textBaseline = "middle";
@@ -1756,7 +1909,7 @@ window.MALAPERT_ANT={"f_mhz":433,"az_step":2,"el_step":2,"el_min":-90,"antennas"
     var dx = q.x - T.bx, dy = q.y - T.by, r = Math.hypot(dx, dy), lim = T.rdisk - 30;
     if (r > lim) { q.x = T.bx + dx * lim / r; q.y = T.by + dy * lim / r; }
   }
-  function markStale() { S.stale = true; S.gen++; $("rd").classList.add("dim"); setChip("Out of date", "stale"); $("stat").textContent = "Press Simulate to update the results."; renderProfile(); persist(); draw(); }
+  function markStale() { if (S.auto && S.auto.paths) S.auto = null; S.stale = true; S.gen++; $("rd").classList.add("dim"); setChip("Out of date", "stale"); $("stat").textContent = "Press Simulate to update the results."; renderProfile(); persist(); draw(); }
   function zoomAt(px, py, f) {
     var x = wx(px), y = wy(py);
     view.s = Math.max(0.01, Math.min(1.6, view.s * f));
@@ -1846,6 +1999,8 @@ window.MALAPERT_ANT={"f_mhz":433,"az_step":2,"el_step":2,"el_min":-90,"antennas"
   function renderPlan() {
     var P = S.plan;
     $("auto").textContent = P && P.drawn ? "Find fewest relays along route" : "Find fewest relays to a point";
+    $("auto-failures").disabled = !!(P && P.drawn);
+    if (P && P.drawn) $("auto-failures").value = 0;
   }
   function nodeCard(q, i) {
     var sim = S.sim, idx = sim ? sim.list.findIndex(function (u) { return u.id === q.id; }) : -1, fresh = sim && !S.stale && idx >= 0;
@@ -2395,6 +2550,7 @@ window.MALAPERT_ANT={"f_mhz":433,"az_step":2,"el_step":2,"el_min":-90,"antennas"
   $("crewh").addEventListener("change", function () { var v = parseFloat($("crewh").value); if (v >= 0.5 && v <= 5) { S.crew.h = v; markStale(); } else $("crewh").value = S.crew.h; });
   $("add").addEventListener("click", function () { setPlacing(!S.placing); });
   $("clear").addEventListener("click", function () { if (S.drawing) setDrawing(false); S.nodes = []; S.seq = 1; S.plan = null; S.auto = null; S.target = null; S.solo = null; markStale(); renderPlan(); renderNodes(); renderLegend(); });
+  $("auto-failures").addEventListener("change", function () { var v = parseInt($("auto-failures").value, 10); $("auto-failures").value = isFinite(v) ? Math.max(0, Math.min(MAX_RELAYS, v)) : 0; });
   $("auto").addEventListener("click", function () { autoPlan(); });
   $("draw").addEventListener("click", function () {
     if (S.drawing) { finishDraw(); return; }

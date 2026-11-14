@@ -5,9 +5,9 @@ const http = require("http"), fs = require("fs"), path = require("path"), { spaw
 const TOOL = path.join(__dirname, "..");
 const SCR = process.env.SCRATCH_DIR;
 const REF = process.env.REF_INDEX;
-const CHROME = "C:/Program Files/Google/Chrome/Application/chrome.exe";
+const CHROME = process.env.CHROME_PATH || (process.platform === "darwin" ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : "C:/Program Files/Google/Chrome/Application/chrome.exe");
 // The shared agent profile only: a new profile makes Chrome try a blank-password Windows sign-in, which counts toward account lockout.
-const PROFILE = path.join(process.env.LOCALAPPDATA, "agent-chrome-profile");
+const PROFILE = path.join(process.platform === "win32" ? process.env.LOCALAPPDATA : SCR, "agent-chrome-profile");
 let ch = null;
 const SHOT = path.join(SCR, "shots_ant");
 fs.mkdirSync(SHOT, { recursive: true });
@@ -54,7 +54,8 @@ async function main() {
   await ev("(() => { try { localStorage.clear(); } catch (e) {} return 1; })()");
   await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
   await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
-  const out = [], say = (s) => { console.log(s); out.push(s); };
+  let failures = 0;
+  const out = [], say = (s) => { console.log(s); out.push(s); if (s.startsWith("FAIL")) failures++; };
   const summary = `(() => { const s = window.malapert.S.sim; const n = s.list.length; let w = Infinity; for (let i = 1; i < n; i++) if (s.conn[i]) w = Math.min(w, s.hop[i][s.par[i]]);
     return { conn: s.conn.filter(Boolean).length - 1, n: n - 1, weak: +w.toFixed(3), area: +s.area.toFixed(3), out: s.route ? +s.route.out.toFixed(3) : null, ms: Math.round(s.ms) }; })()`;
   const ready = "!!(window.malapert && window.malapert.S.sim && !window.malapert.S.busy)";
@@ -75,6 +76,53 @@ async function main() {
     ps.value = "sf9"; ps.dispatchEvent(new Event("change")); M.loadPlan(String(window.MALAPERT_META.plans.findIndex((p) => p.case === "c2" && p.budget === "141")), false); await M.simulate();
     return { ok, start, rate: S.rateTarget, ceil: S.sim && S.sim.r.ceil }; })()`);
   say((tgt.ok ? "PASS" : "FAIL") + " map target and rate target are separate " + JSON.stringify(tgt));
+  // Record actual map drawing, including markers drawn after the path overlay.
+  await ev(`(() => {
+    const P = CanvasRenderingContext2D.prototype, fill = P.fillRect, stroke = P.stroke, arc = P.arc;
+    window.mapDrawing = { strokes: [], arcs: [] };
+    P.fillRect = function (...a) { if (this.canvas.id === "map") window.mapDrawing = { strokes: [], arcs: [] }; return fill.apply(this, a); };
+    P.stroke = function (...a) { if (this.canvas.id === "map") window.mapDrawing.strokes.push({ width: this.lineWidth, color: this.strokeStyle }); return stroke.apply(this, a); };
+    P.arc = function (...a) { if (this.canvas.id === "map") window.mapDrawing.arcs.push(a[2]); return arc.apply(this, a); };
+    return true;
+  })()`);
+  const robust = await ev(`(async () => {
+    const M = window.malapert, S = M.S, input = document.getElementById("auto-failures");
+    S.plan = null; S.base.ant = "iso"; S.relayAnt = "iso";
+    const anchor = { id: "R1", x: S.base.x + 900, y: S.base.y - 700, h: 1.5, ant: "iso", bore: 0 }; S.nodes = [anchor];
+    S.target = { x: S.base.x + 5000, y: S.base.y - 4000 };
+    const one = async (failures) => {
+      input.value = String(failures); await M.autoPlan(true);
+      const paths = S.auto && S.auto.paths || [], mids = paths.flatMap((p) => p.slice(1, -1).map((q) => q.id));
+      let margins = true;
+      for (const p of paths) for (let i = 0; i + 1 < p.length; i++) {
+        const a = p[i], b = p[i + 1]; M.openProfile(a.id, b.id || null, b.id ? null : { x: b.x, y: b.y });
+        const d = M.profile(); if (!d || d.fwd < S.sim.r.fade || d.back < S.sim.r.fade) margins = false;
+      }
+      M.closeProfile();
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const direct = paths.length === 1 && paths[0].length === 2;
+      const disjoint = direct || (paths.length >= failures + 1 && new Set(mids).size === mids.length);
+      const preserved = S.nodes.includes(anchor);
+      const drawing = window.mapDrawing, drawnNodes = drawing.arcs.filter((r) => r === 11).length, drawnTargets = drawing.arcs.filter((r) => r === 8).length;
+      const highlights = drawing.strokes.filter((s) => s.color === "#7fe0c2" && s.width >= 2.5).length;
+      const extraBold = drawing.strokes.filter((s) => s.width >= 2.5 && (s.color === "#f2f4f5" || s.color === "#ffd640")).length;
+      const gray = drawing.strokes.filter((s) => s.width === 1 && s.color === "rgba(170, 178, 186, 0.6)").length;
+      const visible = drawnNodes === S.nodes.length && drawnTargets === 1;
+      const styled = highlights === 1 && extraBold === 0 && (direct || gray > 0);
+      return { failures, nodes: S.nodes.length, paths: paths.length, robust: disjoint && margins && preserved && visible && styled && S.nodes.length <= 12, disjoint, margins, preserved, direct, visible, styled, drawnNodes, drawnTargets, highlights, extraBold, gray };
+    };
+    window.checkRobust = one;
+    return { one: await one(1), two: await one(2) };
+  })()`);
+  say((robust.one.robust ? "PASS" : "FAIL") + " one relay failure leaves a checked base-to-target path set " + JSON.stringify(robust.one));
+  say((robust.two.robust ? "PASS" : "FAIL") + " two relay failures leave a checked base-to-target path set " + JSON.stringify(robust.two));
+  await shot("robust_paths");
+  const impossible = await ev(`(async () => { const result = await window.checkRobust(12); return { result, status: document.getElementById("stat").textContent }; })()`);
+  say((!impossible.result.robust && /No layout survives up to 12 relay failures/.test(impossible.status) ? "PASS" : "FAIL") + " impossible failure request reports the relay limit " + JSON.stringify(impossible.result));
+  if (process.env.POINT_ONLY) {
+    say(logs.length ? "FAIL console: " + logs.join(" | ") : "PASS no console errors");
+    ch.kill(); srv.close(); process.exit(failures ? 1 : 0);
+  }
   const note = await ev(`(() => { const e = document.getElementById("ant-base"); e.value = "dipole"; e.dispatchEvent(new Event("change")); return document.getElementById("ant-note").textContent; })()`);
   say((note.startsWith("Base.") && /dipole/i.test(note) ? "PASS" : "FAIL") + " preview follows the base antenna: " + note.slice(0, 60));
   await ev(`(() => { const e = document.getElementById("ant-base"); e.value = "iso"; e.dispatchEvent(new Event("change")); return 1; })()`);
@@ -100,6 +148,6 @@ async function main() {
   const over = await ev("document.documentElement.scrollWidth > window.innerWidth");
   say((over ? "FAIL" : "PASS") + " no horizontal scroll at 390 px");
   say(logs.length ? "FAIL console: " + logs.join(" | ") : "PASS no console errors");
-  ch.kill(); srv.close(); process.exit(0);
+  ch.kill(); srv.close(); process.exit(failures ? 1 : 0);
 }
 main().catch((e) => { console.error(e); if (ch) ch.kill(); process.exit(1); });
