@@ -9,11 +9,17 @@ Terrain functions take a 2-D height array `dem[row, col]` in meters with square 
 | `p526.py` | Lunar and regolith constants, free-space loss, knife-edge J(v), ITU-R P.526 general method |
 | `hybrid.py` | R2 hybrid loss (P.526 plus rounded-hill and ground terms), terrain sampling, `link_loss` |
 | `pe.py` | Split-step parabolic equation over terrain with a regolith ground, `pe_loss`, `pe_link` |
+| `check_pe.py` | Checks `pe.py` at its default grid against flat regolith, the smooth Moon and circular hills |
 | `budgets.py` | Radio presets (LoRa, FLRC, 5G), 5G NR, Wi-Fi and sidelink budgets, data rate, multi-hop share |
 | `network.py` | Widest chain, reachability, route coverage and out-of-contact time, walking pace, maximum coverage |
 | `antennas.py` | The planner's 433 MHz pattern library (`routing-website/data/antennas.json`) plus a flat −6 dBi `suit`: bilinear gain, beam states, mast tilt, omni listening, planning rows, take-off elevations, and `link` with gains at both ends |
 | `site.py` | Malapert from the planner's data: the 20 m DEM, grid, base, route plans with times and relay drop times, and `Site.link` in map coordinates |
+| `tof.py` | Over-terrain range for time-of-flight ranging: the stretched-string path between two antennas on a spherical Moon, its excess over the straight chord, `ranges` from one point to many and `link_range` |
 | `linktable.py` | Link tables for `mesh-network/sim`: directed loss with antenna gains between every pair over time, from a route plan or a scenario JSON |
+
+## Parabolic equation grid
+
+`pe.py` splits each profile step so it marches at 5 m or finer at 433 MHz and below, and at 5 m × 433 MHz / f above (`substep_for`); the terrain stays the same piecewise-linear profile. The field column is the profile relief plus the larger of 200 m and one fifteenth of the path length (`margin_for`). Coarser steps or lower columns let the top absorber leak: with 20 m steps a smooth 2 km hill reads 19 to 37 dB too little loss, and a 200 m column fails on flat ground beyond about 6 km. Values more than about 100 dB below free space are not converged. `python -B -m models.check_pe` runs the checks (about 7 s).
 
 ## Antennas
 

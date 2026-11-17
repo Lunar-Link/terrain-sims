@@ -27,7 +27,8 @@ from .p526 import C0, F433, R_MOON, REGOLITH_EPS, fspl_db, regolith_sigma
 STEP_LIM = 0.85
 MIN_RANGE = 25.0
 DAMPING = (0.9, 1.0)
-SUBSTEP = {150.0: 1, 260.0: 1, 433.0: 1, 915.0: 2, 2050.0: 5, 2442.0: 6, 2593.0: 6, 3550.0: 8}
+STEP_REF = 5.0
+MARGIN_PER_RANGE = 1 / 15
 
 
 def wavenumber(f_hz):
@@ -38,8 +39,12 @@ def dz_for(f_hz):
     return 1.5 / math.ceil(1.5 * 4.15 / (C0 / f_hz) - 1e-9)
 
 
-def margin_for(f_hz):
-    return 200.0 * max(1.0, 433e6 / f_hz)
+def substep_for(dx, f_hz):
+    return math.ceil(dx / STEP_REF - 1e-9) * max(1, round(f_hz / F433))
+
+
+def margin_for(f_hz, D=0.0):
+    return max(200.0, MARGIN_PER_RANGE * D) * max(1.0, F433 / f_hz)
 
 
 def domain_for(T, margin=200.0):
@@ -201,16 +206,18 @@ def subdivide(z, m):
 
 
 @np.errstate(divide="ignore", invalid="ignore")
-def pe_profile(z, D, h_tx, h_rx, f_hz=F433, substep=1, ae=R_MOON):
-    z = subdivide(z, substep)
-    pe = PE(dz_for(f_hz), D / (z.size - 1), domain_for(z, margin_for(f_hz)), f_hz, ae)
+def pe_profile(z, D, h_tx, h_rx, f_hz=F433, substep=None, ae=R_MOON):
+    z = np.asarray(z, float)
+    m = substep or substep_for(D / (z.size - 1), f_hz)
+    z = subdivide(z, m)
+    pe = PE(dz_for(f_hz), D / (z.size - 1), domain_for(z, margin_for(f_hz, D)), f_hz, ae)
     x, u = pe.run(z, h_tx, (h_rx,))
     rng, th = geometry(x, z, h_tx, h_rx, ae)
     pf = 20 * np.log10(np.abs(u[0]) / free_field_mag(rng, th, pe.k))
-    return x, fspl_db(rng, f_hz) - pf
+    return x[::m], (fspl_db(rng, f_hz) - pf)[::m]
 
 
-def pe_loss(z, D, h_tx, h_rx, f_hz=F433, substep=1):
+def pe_loss(z, D, h_tx, h_rx, f_hz=F433, substep=None):
     z = np.asarray(z, float)
     if D < MIN_RANGE:
         return float(fspl_db(max(math.hypot(D, z[-1] + h_rx - z[0] - h_tx), 1.0), f_hz))
@@ -220,6 +227,6 @@ def pe_loss(z, D, h_tx, h_rx, f_hz=F433, substep=1):
     return float(pe_profile(z, D, h_tx, h_rx, f_hz, substep)[1][-1])
 
 
-def pe_link(dem, cell, x1, y1, x2, y2, h_tx, h_rx, step=None, f_hz=F433, substep=1, scale=1.0):
+def pe_link(dem, cell, x1, y1, x2, y2, h_tx, h_rx, step=None, f_hz=F433, substep=None, scale=1.0):
     z, _, D = profiles(dem, cell, float(x1), float(y1), float(x2), float(y2), step or cell, scale)
     return pe_loss(z[0], float(D[0]), h_tx, h_rx, f_hz, substep)
