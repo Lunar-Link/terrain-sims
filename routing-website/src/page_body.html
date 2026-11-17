@@ -20,6 +20,9 @@
       </section>
       <section aria-label="Plan">
         <h2>Plan</h2>
+        <label class="f">Reference route
+          <select id="route-sel"></select>
+        </label>
         <div class="btns">
           <button id="add" class="btn" type="button" aria-pressed="false">Add relay</button>
           <button id="clear" class="btn" type="button">Remove all relays</button>
@@ -27,6 +30,7 @@
         <div class="autop">
           <div class="btns">
             <button id="auto" class="btn" type="button" aria-pressed="false">Find fewest relays to a point</button>
+            <button id="auto-route" class="btn" type="button" hidden>Find fewest relays along this route</button>
             <button id="draw" class="btn" type="button" aria-pressed="false">Draw route</button>
             <button id="undo" class="btn" type="button" hidden>Undo point</button>
           </div>
@@ -38,6 +42,9 @@
               <input id="auto-x" type="number" min="0" max="20" step="1" value="0">
             </label>
           </div>
+          <label class="ov1" id="auto-near-row" hidden><input type="checkbox" id="auto-near">Keep relays within 100 m of the route</label>
+          <label class="ov1"><input type="checkbox" id="auto-hb">High bandwidth: keep relay hops in FLRC burst range (487 kb/s, video)</label>
+          <p class="autonote" id="auto-note" hidden></p>
         </div>
       </section>
       <section aria-label="Save and share">
@@ -49,7 +56,6 @@
           <button id="reset" class="btn" type="button">Start over</button>
           <input id="importf" type="file" accept=".json,application/json" hidden>
         </div>
-        <div class="st">The plan is kept in this browser and in the page link, so the link opens the same plan. Export writes a JSON file that the mesh simulator's link-table builder reads: <code>python -B -m models.linktable plan.json -o plan.txt</code> in terrain-sims.</div>
       </section>
       <section aria-label="Radio">
         <h2>Radio</h2>
@@ -97,8 +103,6 @@
           <label class="ov1"><input type="checkbox" id="t-pat" checked>Show shapes on map</label>
         </div>
         <canvas id="antprev" width="340" height="170" aria-label="Horizon and vertical pattern of the chosen antenna against a half-wave dipole"></canvas>
-        <div id="ant-note" class="st"></div>
-        <div class="st antcav">Free-space patterns of lossless 433 MHz designs, added at the node end of every link at the ray's take-off angle, and at both ends between nodes; the crew or target end stays 0 dBi. The terrain model already includes the ground. Switched and phased arrays use their best beam for each link. Isotropic is the study's assumption and the default.</div>
       </section>
       <section aria-label="Sites">
         <h2>Sites</h2>

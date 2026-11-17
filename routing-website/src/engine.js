@@ -674,8 +674,168 @@ var LL = (function () {
     return best;
   }
 
+  // ---- fewest sites that cover every target and stay linked to site 0
+  // cov holds one bit row of nt targets per site, adj one bit row of m sites per site (symmetric). Sizes are tried from 1 up to kmax: each level
+  // branches on the uncovered target with the fewest covering sites, and a full cover that is not linked may take one or two bridge sites. A site
+  // is dropped first when another covers and links at least as much. Returns up to `keep` sets of the smallest size found; `proven` says every
+  // smaller size was ruled out, and with no set found, that no set of kmax or fewer exists.
+  function fewestCover(m, nt, cov, adj, kmax, keep, budgetMs, clock) {
+    var W = Math.max(1, Math.ceil(nt / 32)), Wm = Math.ceil(m / 32), now = clock || Date.now, t0 = now(), i, u, v, w;
+    var pop = function (x) { x -= (x >>> 1) & 0x55555555; x = (x & 0x33333333) + ((x >>> 2) & 0x33333333); return (((x + (x >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24; };
+    var U0 = new Uint32Array(W), left0 = 0;
+    for (i = 0; i < nt; i++) if (!(cov[i >>> 5] >>> (i & 31) & 1)) { U0[i >>> 5] |= 1 << (i & 31); left0++; }
+    if (!left0) return { k: 0, sets: [[]], proven: true, nodes: 0, live: 0, ms: 0 };
+    var cu = new Uint32Array(m * W);
+    for (u = 0; u < m; u++) for (w = 0; w < W; w++) cu[u * W + w] = cov[u * W + w] & U0[w];
+    var live = new Uint8Array(m), nl = 0;
+    for (u = 1; u < m; u++) {
+      var dom = false;
+      for (v = 1; v < m && !dom; v++) {
+        if (v === u) continue;
+        var sub = true, eq = true;
+        for (w = 0; w < W && sub; w++) { var a = cu[u * W + w], b = cu[v * W + w]; if (a & ~b) sub = false; else if (a !== b) eq = false; }
+        for (w = 0; w < Wm && sub; w++) {
+          var x = adj[u * Wm + w], y = adj[v * Wm + w];
+          if ((v >>> 5) === w) x &= ~(1 << (v & 31));
+          if ((u >>> 5) === w) y &= ~(1 << (u & 31));
+          if (x & ~y) sub = false; else if (x !== y) eq = false;
+        }
+        if (sub && (!eq || v < u)) dom = true;
+      }
+      if (!dom) { live[u] = 1; nl++; }
+    }
+    var byT = [], t;
+    for (t = 0; t < nt; t++) { var l = []; if (U0[t >>> 5] >>> (t & 31) & 1) for (u = 1; u < m; u++) if (live[u] && (cu[u * W + (t >>> 5)] >>> (t & 31) & 1)) l.push(u); byT.push(l); }
+    var linked = function (a, b) { return adj[a * Wm + (b >>> 5)] >>> (b & 31) & 1; };
+    var sets = [], keys = {}, seen, nodes = 0, gap = false, STOP = {}, TIME = {};
+    var record = function (ids) {
+      var s = ids.slice().sort(function (p, q) { return p - q; }), key = s.join(",");
+      if (keys[key]) return;
+      keys[key] = 1; sets.push(s);
+      if (sets.length >= keep) throw STOP;
+    };
+    var leaf = function (chosen, left) {
+      var ids = [0].concat(chosen), n = ids.length, comp = new Int32Array(n).fill(-1), nc = 0, st = [], a, b, c;
+      for (a = 0; a < n; a++) {
+        if (comp[a] >= 0) continue;
+        comp[a] = nc; st.push(a);
+        while (st.length) { c = st.pop(); for (b = 0; b < n; b++) if (comp[b] < 0 && linked(ids[c], ids[b])) { comp[b] = nc; st.push(b); } }
+        nc++;
+      }
+      if (nc === 1) { record(chosen); return; }
+      if (left < 1) return;
+      var all = (1 << nc) - 1, att = new Int32Array(m), found = false, inSet = new Uint8Array(m);
+      for (a = 0; a < n; a++) inSet[ids[a]] = 1;
+      for (b = 1; b < m; b++) {
+        if (inSet[b] || !live[b]) continue;
+        for (a = 0; a < n; a++) if (linked(b, ids[a])) att[b] |= 1 << comp[a];
+        if (att[b] === all) { found = true; record(chosen.concat([b])); }
+      }
+      if (found || left < 2) return;
+      for (b = 1; b < m; b++) {
+        if (!att[b]) continue;
+        for (c = b + 1; c < m; c++) if (att[c] && (att[b] | att[c]) === all && ((att[b] & att[c]) || linked(b, c))) { found = true; record(chosen.concat([b, c])); }
+      }
+      if (!found && left >= 3) gap = true;
+    };
+    var dfs = function (U, nU, chosen, left) {
+      if ((nodes++ & 255) === 0 && now() - t0 > budgetMs) throw TIME;
+      if (!nU) { leaf(chosen, left); return; }
+      if (!left) return;
+      var key = chosen.slice().sort(function (p, q) { return p - q; }).join(",");
+      if (seen[key]) return;
+      seen[key] = 1;
+      var best = -1, bl = Infinity, w2, bits, q, g, mx = 0;
+      for (w2 = 0; w2 < W; w2++) { bits = U[w2]; while (bits) { q = 31 - Math.clz32(bits & -bits); bits &= bits - 1; g = byT[w2 * 32 + q].length; if (g < bl) { bl = g; best = w2 * 32 + q; } } }
+      if (!bl) return;
+      for (q = 1; q < m; q++) { if (!live[q]) continue; g = 0; for (w2 = 0; w2 < W; w2++) g += pop(cu[q * W + w2] & U[w2]); if (g > mx) mx = g; }
+      if (left * mx < nU) return;
+      var c = byT[best].map(function (s) { var gg = 0; for (var z = 0; z < W; z++) gg += pop(cu[s * W + z] & U[z]); return [s, gg]; }).sort(function (p, r) { return r[1] - p[1]; });
+      for (q = 0; q < c.length; q++) {
+        var V = new Uint32Array(W);
+        for (w2 = 0; w2 < W; w2++) V[w2] = U[w2] & ~cu[c[q][0] * W + w2];
+        chosen.push(c[q][0]); dfs(V, nU - c[q][1], chosen, left - 1); chosen.pop();
+      }
+    };
+    var out = function (k, proven) { return { k: k, sets: sets, proven: proven, nodes: nodes, live: nl, ms: now() - t0 }; };
+    for (var k = 1; k <= kmax; k++) {
+      seen = {};
+      try { dfs(U0, left0, [], k); }
+      catch (e) { if (e === TIME) return out(sets.length ? k : null, sets.length > 0 && !gap); if (e !== STOP) throw e; }
+      if (sets.length) return out(k, !gap);
+    }
+    return out(null, !gap);
+  }
+
+  // ---- shortest walk between two map points on the terrain grid
+  // A* over the eight neighbors with the 3-D step length. A cell is closed when it is outside the mask or its slope (slope[i] / 4, degrees) is over
+  // maxDeg, and a step when its grade is or when it cuts the corner of a closed cell; the two end cells stay open. The grid path is then pulled taut: from each point it skips to the farthest
+  // later point that a straight line reaches over open cells. Returns the points as a flat x, y list with the 3-D length, or null.
+  function walkPath(ter, slope, mask, x0, y0, x1, y1, maxDeg) {
+    var nc = ter.nc, nr = ter.nr, cell = ter.cell, z = ter.z;
+    var cellAt = function (x, y) { var c = Math.round((x - ter.x0) / cell), r = Math.round((ter.ytop - y) / cell); return r < 0 || c < 0 || r >= nr || c >= nc ? -1 : r * nc + c; };
+    var a = cellAt(x0, y0), b = cellAt(x1, y1);
+    if (a < 0 || b < 0) return null;
+    var n = nr * nc, g = new Float32Array(n).fill(Infinity), par = new Int32Array(n).fill(-1), done = new Uint8Array(n), hk = [], hv = [], lim = Math.tan(maxDeg * Math.PI / 180), bc = b % nc, br = Math.floor(b / nc);
+    var shut = function (i) { return !mask[i] || slope[i] / 4 > maxDeg; };
+    var push = function (k, v) { var i = hk.length; hk.push(k); hv.push(v); while (i > 0) { var q = (i - 1) >> 1; if (hk[q] <= k) break; hk[i] = hk[q]; hv[i] = hv[q]; i = q; } hk[i] = k; hv[i] = v; };
+    var pop = function () {
+      var top = hv[0], k = hk.pop(), v = hv.pop(), len = hk.length, i = 0;
+      if (len) { for (;;) { var c = 2 * i + 1; if (c >= len) break; if (c + 1 < len && hk[c + 1] < hk[c]) c++; if (hk[c] >= k) break; hk[i] = hk[c]; hv[i] = hv[c]; i = c; } hk[i] = k; hv[i] = v; }
+      return top;
+    };
+    g[a] = 0; push(Math.hypot((a % nc) - bc, Math.floor(a / nc) - br) * cell, a);
+    while (hk.length) {
+      var u = pop();
+      if (done[u]) continue;
+      done[u] = 1;
+      if (u === b) break;
+      var uc = u % nc, ur = (u - uc) / nc;
+      for (var dr = -1; dr <= 1; dr++) for (var dc = -1; dc <= 1; dc++) {
+        if (!dr && !dc) continue;
+        var vr = ur + dr, vc = uc + dc;
+        if (vr < 0 || vc < 0 || vr >= nr || vc >= nc) continue;
+        var v = vr * nc + vc;
+        if (done[v] || (v !== b && shut(v))) continue;
+        if (dr && dc) { var s1 = ur * nc + vc, s2 = vr * nc + uc; if ((s1 !== a && s1 !== b && shut(s1)) || (s2 !== a && s2 !== b && shut(s2))) continue; }
+        var d = cell * (dr && dc ? Math.SQRT2 : 1), dz = z[v] - z[u];
+        if (Math.abs(dz) > lim * d) continue;
+        var ng = g[u] + Math.sqrt(d * d + dz * dz);
+        if (ng < g[v]) { g[v] = ng; par[v] = u; push(ng + Math.hypot(vc - bc, vr - br) * cell, v); }
+      }
+    }
+    if (!done[b]) return null;
+    var px = [], py = [];
+    for (var c2 = b; c2 >= 0; c2 = par[c2]) { px.push(ter.x0 + (c2 % nc) * cell); py.push(ter.ytop - Math.floor(c2 / nc) * cell); }
+    px.reverse(); py.reverse();
+    var open = function (i, j) {
+      var dd = Math.hypot(px[j] - px[i], py[j] - py[i]), m = Math.max(1, Math.ceil(dd / (cell / 8)));
+      for (var k = 1; k < m; k++) { var q = cellAt(px[i] + (px[j] - px[i]) * k / m, py[i] + (py[j] - py[i]) * k / m); if (q < 0 || shut(q)) return false; }
+      return true;
+    };
+    var out = [px[0], py[0]], at = 0, len = 0;
+    while (at < px.length - 1) {
+      var j = Math.min(px.length - 1, at + 80);
+      while (j > at + 1 && !open(at, j)) j--;
+      var m2 = Math.max(1, Math.ceil(Math.hypot(px[j] - px[at], py[j] - py[at]) / cell)), z0 = ter.sample(px[at], py[at]), seg = Math.hypot(px[j] - px[at], py[j] - py[at]) / m2;
+      for (var k2 = 1; k2 <= m2; k2++) { var z1 = ter.sample(px[at] + (px[j] - px[at]) * k2 / m2, py[at] + (py[j] - py[at]) * k2 / m2); len += Math.sqrt(seg * seg + (z1 - z0) * (z1 - z0)); z0 = z1; }
+      out.push(px[j], py[j]); at = j;
+    }
+    return { pts: out, len: len, deg: maxDeg };
+  }
+
   // ---- worker jobs, shared by the page's Web Workers and the Node timing harness
   function handle(state, m) {
+    if (m.type === "walk") {
+      var wp = null;
+      for (var wd = 0; wd < m.degs.length && !wp; wd++) wp = walkPath(state.ter, m.slope, m.mask, m.x0, m.y0, m.x1, m.y1, m.degs[wd]);
+      return wp ? { type: "walk", id: m.id, pts: Float64Array.from(wp.pts), len: wp.len, deg: wp.deg } : { type: "walk", id: m.id, pts: null };
+    }
+    if (m.type === "cover") {
+      var fc = fewestCover(m.m, m.nt, m.cov, m.adj, m.kmax, m.keep, m.budget);
+      fc.type = "cover"; fc.id = m.id;
+      return fc;
+    }
     if (m.type === "init") {
       var t = m.terrain;
       state.ter = new Terrain(m.dem, t.nr, t.nc, t.x0, t.ytop, t.cell, t.bx, t.by, t.rdisk);
@@ -708,7 +868,7 @@ var LL = (function () {
     handle: handle, C0: C0, R_MOON: R_MOON, FINAL: FINAL, J: J, sigma: sigma, mapScale: mapScale, Params: Params, p526: p526, hybridProfile: hybridProfile,
     Terrain: Terrain, linkLoss: linkLoss, Sweep: Sweep, radialEnd: radialEnd, coverageBlock: coverageBlock, rasterize: rasterize, widestChain: widestChain,
     tSys: tSys, shannonRate: shannonRate, lossForRate: lossForRate, hopShare: hopShare, nrRate: nrRate, K_DBM: K_DBM,
-    Antenna: Antenna, elGain: elGain, bearing: bearing
+    Antenna: Antenna, elGain: elGain, bearing: bearing, fewestCover: fewestCover, walkPath: walkPath
   };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = LL;

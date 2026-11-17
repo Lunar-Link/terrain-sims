@@ -75,8 +75,8 @@ async function main() {
     ps.value = "sf9"; ps.dispatchEvent(new Event("change")); M.loadPlan(String(window.MALAPERT_META.plans.findIndex((p) => p.case === "c2" && p.budget === "141")), false); await M.simulate();
     return { ok, start, rate: S.rateTarget, ceil: S.sim && S.sim.r.ceil }; })()`);
   say((tgt.ok ? "PASS" : "FAIL") + " map target and rate target are separate " + JSON.stringify(tgt));
-  const note = await ev(`(() => { const e = document.getElementById("ant-base"); e.value = "dipole"; e.dispatchEvent(new Event("change")); return document.getElementById("ant-note").textContent; })()`);
-  say((note.startsWith("Base.") && /dipole/i.test(note) ? "PASS" : "FAIL") + " preview follows the base antenna: " + note.slice(0, 60));
+  const note = await ev(`(() => { const e = document.getElementById("ant-base"); e.value = "dipole"; e.dispatchEvent(new Event("change")); return document.getElementById("antprev").getAttribute("aria-label"); })()`);
+  say((/of the base antenna, [^,]*dipole/i.test(note) ? "PASS" : "FAIL") + " preview follows the base antenna: " + note.slice(0, 80));
   await ev(`(() => { const e = document.getElementById("ant-base"); e.value = "iso"; e.dispatchEvent(new Event("change")); return 1; })()`);
   const ids = await ev("Object.keys(window.malapert.ANTS)");
   for (const a of ids) {
